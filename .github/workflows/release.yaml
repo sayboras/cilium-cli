@@ -4,12 +4,14 @@ on:
     tags:
       - 'v*' # Push events to matching v*, i.e. v1.0, v20.15.10
 
-name: Create Release
+env:
+  GO_VERSION: 1.17.6
+  GO_RELEASER_VERSION: v1.3.1
 
 jobs:
   build:
     name: Create Release
-    if: github.repository == 'cilium/cilium-cli'
+#    if: github.repository == 'cilium/cilium-cli'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -18,38 +20,23 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@424fc82d43fa5a37540bae62709ddcc23d9520d4
         with:
-          go-version: 1.17.6
+          go-version: ${{ env.GO_VERSION }}
+      - name: Unshallow
+        run: git fetch --prune --unshallow
 
-      - name: Generate the artifacts
-        run: make release
-
-      - name: Create Release
-        id: create_release
-        uses: actions/create-release@0cb9c9b65d5d1901c1f53e5e66eaf4afd303e70e
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # This token is provided by Actions, you do not need to create your own token
+      - name: Create release
+        uses: goreleaser/goreleaser-action@v2
         with:
-          tag_name: ${{ github.ref }}
-          release_name: Release ${{ github.ref }}
-          draft: true # turn this to false once release notes are automatically added
-          prerelease: false
-          body: |
-            Note for maintainers:: Please update the description with the actual release notes (see RELEASE.md for instructions).
-
-      - name: Upload the artifacts
-        id: upload-release-artifacts
-        uses: skx/github-action-publish-binaries@b9ca5643b2f1d7371a6cba7f35333f1461bbc703
+          version: ${{ env.GO_RELEASER_VERSION }}
+          args: release --rm-dist
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          releaseId: ${{ steps.create_release.outputs.id }}
-          args: 'release/*'
+          GITHUB_TOKEN: ${{ secrets.CILIUM_GITHUB_TOKEN }}
 
-      - name: Send slack notification
-        if: ${{ !success() && (github.event_name == 'schedule' || github.event_name == 'push') }}
-        uses: 8398a7/action-slack@a74b761b4089b5d730d813fbedcd2ec5d394f3af
-        with:
-          status: ${{ job.status }}
-          fields: repo,message,commit,author,action,eventName,ref,workflow,job,took
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+#      - name: Send slack notification
+#        if: ${{ !success() && (github.event_name == 'schedule' || github.event_name == 'push') }}
+#        uses: 8398a7/action-slack@a74b761b4089b5d730d813fbedcd2ec5d394f3af
+#        with:
+#          status: ${{ job.status }}
+#          fields: repo,message,commit,author,action,eventName,ref,workflow,job,took
+#        env:
+#          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
