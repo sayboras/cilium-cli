@@ -24,14 +24,14 @@ import (
 
 var errInternal = errors.New("encountered internal error, exiting")
 
-func newCmdConnectivity() *cobra.Command {
+func newCmdConnectivity(hooks Hooks) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "connectivity",
 		Short: "Connectivity troubleshooting",
 		Long:  ``,
 	}
 
-	cmd.AddCommand(newCmdConnectivityTest())
+	cmd.AddCommand(newCmdConnectivityTest(hooks))
 
 	return cmd
 }
@@ -46,7 +46,7 @@ var params = check.Parameters{
 }
 var tests []string
 
-func newCmdConnectivityTest() *cobra.Command {
+func newCmdConnectivityTest(hooks Hooks) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "test",
 		Short: "Validate connectivity in cluster",
@@ -71,7 +71,7 @@ func newCmdConnectivityTest() *cobra.Command {
 			}
 
 			// Instantiate the test harness.
-			cc, err := check.NewConnectivityTest(k8sClient, params, Version)
+			cc, err := check.NewConnectivityTest(k8sClient, params, version)
 			if err != nil {
 				return err
 			}
@@ -90,7 +90,7 @@ func newCmdConnectivityTest() *cobra.Command {
 			// and end the goroutine without returning.
 			go func() {
 				defer func() { done <- struct{}{} }()
-				err = connectivity.Run(ctx, cc)
+				err = connectivity.Run(ctx, cc, hooks.AddConnectivityTests)
 
 				// If Fatal() was called in the test suite, the statement below won't fire.
 				finished = true
@@ -120,6 +120,10 @@ func newCmdConnectivityTest() *cobra.Command {
 	cmd.Flags().StringVar(&params.AgentDaemonSetName, "agent-daemonset-name", defaults.AgentDaemonSetName, "Name of cilium agent daemonset")
 	cmd.Flags().StringVar(&params.AgentPodSelector, "agent-pod-selector", defaults.AgentPodSelector, "Label on cilium-agent pods to select with")
 	cmd.Flags().StringToStringVar(&params.NodeSelector, "node-selector", map[string]string{}, "Restrict connectivity test pods to nodes matching this label")
+	cmd.Flags().Var(&params.NamespaceAnnotations, "namespace-annotations", "Add annotations to the connectivity test namespace, e.g. '{\"foo\":\"bar\"}'")
+	cmd.Flags().MarkHidden("namespace-annotations")
+	cmd.Flags().Var(&params.DeploymentAnnotations, "deployment-pod-annotations", "Add annotations to the connectivity test pods, e.g. '{\"client\":{\"foo\":\"bar\"}}'")
+	cmd.Flags().MarkHidden("deployment-pod-annotations")
 	cmd.Flags().StringVar(&params.MultiCluster, "multi-cluster", "", "Test across clusters to given context")
 	cmd.Flags().StringSliceVar(&tests, "test", []string{}, "Run tests that match one of the given regular expressions, skip tests by starting the expression with '!', target Scenarios with e.g. '/pod-to-cidr'")
 	cmd.Flags().StringVar(&params.FlowValidation, "flow-validation", check.FlowValidationModeWarning, "Enable Hubble flow validation { disabled | warning | strict }")
@@ -133,11 +137,12 @@ func newCmdConnectivityTest() *cobra.Command {
 	cmd.Flags().StringVar(&params.ExternalCIDR, "external-cidr", "1.0.0.0/8", "CIDR to use as external target in connectivity tests")
 	cmd.Flags().StringVar(&params.ExternalIP, "external-ip", "1.1.1.1", "IP to use as external target in connectivity tests")
 	cmd.Flags().StringVar(&params.ExternalOtherIP, "external-other-ip", "1.0.0.1", "Other IP to use as external target in connectivity tests")
-	cmd.Flags().StringSliceVar(&params.ExternalFromCIDRs, "external-from-cidrs", []string{}, "CIDRs representing nodes without Cilium to be used in connectivity tests")
+	cmd.Flags().StringVar(&params.JunitFile, "junit-file", "", "Generate junit report and write to file")
+	cmd.Flags().StringToStringVar(&params.JunitProperties, "junit-property", map[string]string{}, "Add key=value properties to the generated junit file")
 	cmd.Flags().BoolVar(&params.SkipIPCacheCheck, "skip-ip-cache-check", true, "Skip IPCache check")
 	cmd.Flags().MarkHidden("skip-ip-cache-check")
-	cmd.Flags().BoolVar(&params.Datapath, "datapath", false, "Run datapath conformance tests")
-	cmd.Flags().MarkHidden("datapath")
+	cmd.Flags().BoolVar(&params.IncludeUnsafeTests, "include-unsafe-tests", false, "Include tests which can modify cluster nodes state")
+	cmd.Flags().MarkHidden("include-unsafe-tests")
 
 	cmd.Flags().StringVar(&params.K8sVersion, "k8s-version", "", "Kubernetes server version in case auto-detection fails")
 	cmd.Flags().StringVar(&params.HelmChartDirectory, "chart-directory", "", "Helm chart directory")
@@ -156,12 +161,23 @@ func newCmdConnectivityTest() *cobra.Command {
 	cmd.Flags().StringVar(&params.JSONMockImage, "json-mock-image", defaults.ConnectivityCheckJSONMockImage, "Image path to use for json mock")
 	cmd.Flags().StringVar(&params.DNSTestServerImage, "dns-test-server-image", defaults.ConnectivityDNSTestServerImage, "Image path to use for CoreDNS")
 
+	cmd.Flags().UintVar(&params.Retry, "retry", defaults.ConnectRetry, "Number of retries on connection failure to external targets")
+	cmd.Flags().DurationVar(&params.RetryDelay, "retry-delay", defaults.ConnectRetryDelay, "Delay between retries for external targets")
+
 	cmd.Flags().DurationVar(&params.ConnectTimeout, "connect-timeout", defaults.ConnectTimeout, "Maximum time to allow initiation of the connection to take")
 	cmd.Flags().DurationVar(&params.RequestTimeout, "request-timeout", defaults.RequestTimeout, "Maximum time to allow a request to take")
+	cmd.Flags().BoolVar(&params.CurlInsecure, "curl-insecure", false, "Pass --insecure to curl")
 
 	cmd.Flags().BoolVar(&params.CollectSysdumpOnFailure, "collect-sysdump-on-failure", false, "Collect sysdump after a test fails")
 
-	initSysdumpFlags(cmd, &params.SysdumpOptions, "sysdump-")
+	initSysdumpFlags(cmd, &params.SysdumpOptions, "sysdump-", hooks)
+
+	cmd.Flags().BoolVar(&params.IncludeUpgradeTest, "include-upgrade-test", false, "Include upgrade test")
+	cmd.Flags().BoolVar(&params.UpgradeTestSetup, "upgrade-test-setup", false, "Set up upgrade test dependencies")
+	cmd.Flags().StringVar(&params.UpgradeTestResultPath, "upgrade-test-result-path", "/tmp/cilium-upgrade-test-restart-counts", "Upgrade test temporary result file (used internally)")
+	cmd.Flags().BoolVar(&params.FlushCT, "flush-ct", false, "Flush conntrack of Cilium on each node")
+
+	hooks.AddConnectivityTestFlags(cmd.Flags())
 
 	return cmd
 }

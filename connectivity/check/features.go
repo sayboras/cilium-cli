@@ -61,7 +61,11 @@ const (
 	FeatureCNP Feature = "cilium-network-policy"
 	FeatureKNP Feature = "k8s-network-policy"
 
-	FeatureAuthMTLSSpiffe Feature = "auth-mtls-spiffe"
+	FeatureAuthSpiffe Feature = "mutual-auth-spiffe"
+
+	FeatureIngressController Feature = "ingress-controller"
+
+	FeatureEgressGateway Feature = "enable-ipv4-egress-gateway"
 )
 
 // FeatureStatus describes the status of a feature. Some features are either
@@ -142,6 +146,16 @@ func RequireFeatureEnabled(feature Feature) FeatureRequirement {
 	}
 }
 
+// RequireFeatureDisabled constructs a FeatureRequirement which expects the
+// feature to be disabled
+func RequireFeatureDisabled(feature Feature) FeatureRequirement {
+	return FeatureRequirement{
+		feature:         feature,
+		requiresEnabled: true,
+		enabled:         false,
+	}
+}
+
 // RequireFeatureMode constructs a FeatureRequirement which expects the feature
 // to be in the given mode
 func RequireFeatureMode(feature Feature, mode string) FeatureRequirement {
@@ -182,13 +196,29 @@ func (ct *ConnectivityTest) extractFeaturesFromConfigMap(ctx context.Context, cl
 		Mode:    mode,
 	}
 
-	mode = "disabled"
-	if v, ok := cm.Data["tunnel"]; ok {
-		mode = v
-	}
-	result[FeatureTunnel] = FeatureStatus{
-		Enabled: mode != "disabled",
-		Mode:    mode,
+	if versioncheck.MustCompile("<1.14.0")(ct.CiliumVersion) {
+		mode = "disabled"
+		if v, ok := cm.Data["tunnel"]; ok {
+			mode = v
+		}
+		result[FeatureTunnel] = FeatureStatus{
+			Enabled: mode != "disabled",
+			Mode:    mode,
+		}
+	} else {
+		mode = "native"
+		if v, ok := cm.Data["routing-mode"]; ok {
+			mode = v
+		}
+		tunnelProto := ""
+		if mode != "native" {
+			tunnelProto = cm.Data["tunnel-protocol"]
+		}
+
+		result[FeatureTunnel] = FeatureStatus{
+			Enabled: mode != "native",
+			Mode:    tunnelProto,
+		}
 	}
 
 	result[FeatureIPv4] = FeatureStatus{
@@ -202,8 +232,16 @@ func (ct *ConnectivityTest) extractFeaturesFromConfigMap(ctx context.Context, cl
 		Enabled: cm.Data["enable-endpoint-routes"] == "true",
 	}
 
-	result[FeatureAuthMTLSSpiffe] = FeatureStatus{
-		Enabled: cm.Data["mesh-auth-mtls-enabled"] == "true",
+	result[FeatureAuthSpiffe] = FeatureStatus{
+		Enabled: cm.Data["mesh-auth-mutual-enabled"] == "true",
+	}
+
+	result[FeatureIngressController] = FeatureStatus{
+		Enabled: cm.Data["enable-ingress-controller"] == "true",
+	}
+
+	result[FeatureEgressGateway] = FeatureStatus{
+		Enabled: cm.Data["enable-ipv4-egress-gateway"] == "true",
 	}
 
 	return nil
@@ -240,7 +278,7 @@ func (ct *ConnectivityTest) extractFeaturesFromRuntimeConfig(ctx context.Context
 		Enabled: cfg.EncryptNode,
 	}
 
-	isFeatureKNPEnabled, err := ct.isFeatureKNPEnabled(namespace, cfg.EnableK8sNetworkPolicy)
+	isFeatureKNPEnabled, err := ct.isFeatureKNPEnabled(cfg.EnableK8sNetworkPolicy)
 	if err != nil {
 		return fmt.Errorf("unable to determine if KNP feature is enabled: %w", err)
 	}
@@ -259,10 +297,12 @@ func (ct *ConnectivityTest) extractFeaturesFromNodes(ctx context.Context, client
 	}
 
 	nodes := []string{}
+	ct.nodesWithoutCiliumMap = make(map[string]struct{})
 	for _, node := range nodeList.Items {
 		node := node
 		if !canNodeRunCilium(&node) {
 			nodes = append(nodes, node.ObjectMeta.Name)
+			ct.nodesWithoutCiliumMap[node.ObjectMeta.Name] = struct{}{}
 		}
 	}
 
@@ -345,7 +385,7 @@ func (ct *ConnectivityTest) extractFeaturesFromCiliumStatus(ctx context.Context,
 	mode = "Disabled"
 	if kpr := st.KubeProxyReplacement; kpr != nil {
 		mode = kpr.Mode
-		if f := kpr.Features; f != nil {
+		if f := kpr.Features; kpr.Mode != "Disabled" && f != nil {
 			if f.ExternalIPs != nil {
 				result[FeatureKPRExternalIPs] = FeatureStatus{Enabled: f.ExternalIPs.Enabled}
 			}
@@ -421,7 +461,7 @@ func (ct *ConnectivityTest) extractFeaturesFromCRDs(ctx context.Context, result 
 
 func (ct *ConnectivityTest) validateFeatureSet(other FeatureSet, source string) {
 	for key, found := range other {
-		expected, ok := ct.features[key]
+		expected, ok := ct.Features[key]
 		if !ok {
 			ct.Warnf("Cilium feature %q found in pod %s, but not in reference set", key, source)
 		} else {
@@ -431,7 +471,7 @@ func (ct *ConnectivityTest) validateFeatureSet(other FeatureSet, source string) 
 		}
 	}
 
-	for key := range ct.features {
+	for key := range ct.Features {
 		if _, ok := other[key]; !ok {
 			ct.Warnf("Cilium feature %q not found in pod %s", key, source)
 		}
@@ -496,7 +536,7 @@ func (ct *ConnectivityTest) detectFeatures(ctx context.Context) error {
 		if initialized {
 			ct.validateFeatureSet(features, ciliumPod.Name())
 		} else {
-			ct.features = features
+			ct.Features = features
 			initialized = true
 		}
 	}
@@ -505,16 +545,16 @@ func (ct *ConnectivityTest) detectFeatures(ctx context.Context) error {
 }
 
 func (ct *ConnectivityTest) UpdateFeaturesFromNodes(ctx context.Context) error {
-	return ct.extractFeaturesFromNodes(ctx, ct.client, ct.features)
+	return ct.extractFeaturesFromNodes(ctx, ct.client, ct.Features)
 }
 
 func (ct *ConnectivityTest) ForceDisableFeature(feature Feature) {
-	ct.features[feature] = FeatureStatus{Enabled: false}
+	ct.Features[feature] = FeatureStatus{Enabled: false}
 }
 
 // isFeatureKNPEnabled checks if the Kubernetes Network Policy feature is enabled from the configuration.
 // Note that the flag appears in Cilium version 1.14, before that it was unable even thought KNPs were present.
-func (ct *ConnectivityTest) isFeatureKNPEnabled(namespace string, enableK8SNetworkPolicy bool) (bool, error) {
+func (ct *ConnectivityTest) isFeatureKNPEnabled(enableK8SNetworkPolicy bool) (bool, error) {
 	switch {
 	case enableK8SNetworkPolicy:
 		// Flag is enabled, means the flag exists.

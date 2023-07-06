@@ -4,6 +4,7 @@
 package check
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"errors"
@@ -26,6 +27,10 @@ import (
 
 	"github.com/cilium/cilium-cli/connectivity/filters"
 	"github.com/cilium/cilium-cli/defaults"
+)
+
+const (
+	testCommandRetries = 3
 )
 
 // Action represents an individual action (e.g. a curl call) in a Scenario
@@ -73,21 +78,25 @@ type Action struct {
 
 	// Output from action if there is any
 	cmdOutput string
+
+	// metricsPerSource collected at the initialisation of an Action.
+	metricsPerSource promMetricsPerSource
 }
 
 func newAction(t *Test, name string, s Scenario, src *Pod, dst TestPeer, ipFam IPFamily) *Action {
 	return &Action{
-		name:         name,
-		test:         t,
-		scenario:     s,
-		src:          src,
-		dst:          dst,
-		ipFam:        ipFam,
-		CollectFlows: true,
-		flowResults:  map[TestPeer]FlowRequirementResults{},
-		started:      time.Now(),
-		failed:       false,
-		cmdOutput:    "",
+		name:             name,
+		test:             t,
+		scenario:         s,
+		src:              src,
+		dst:              dst,
+		ipFam:            ipFam,
+		CollectFlows:     true,
+		flowResults:      map[TestPeer]FlowRequirementResults{},
+		started:          time.Now(),
+		failed:           false,
+		cmdOutput:        "",
+		metricsPerSource: make(promMetricsPerSource),
 	}
 }
 
@@ -133,6 +142,21 @@ func (a *Action) Run(f func(*Action)) {
 
 	// Emit unbuffered progress indicator.
 	a.test.progress()
+
+	// Retrieve Prometheus metrics only if there are expectations.
+	for _, m := range a.expIngress.Metrics {
+		err := a.collectMetricsPerSource(m)
+		if err != nil {
+			a.Logf("❌ Failed to collect metrics for ingress from source %s: %w", m.Source, err)
+		}
+
+	}
+	for _, m := range a.expEgress.Metrics {
+		err := a.collectMetricsPerSource(m)
+		if err != nil {
+			a.Logf("❌ Failed to collect metrics for egress from source %s: %w", m.Source, err)
+		}
+	}
 
 	// Only perform flow validation if a Hubble Relay connection is available.
 	if a.test.ctx.params.Hubble && a.CollectFlows {
@@ -195,6 +219,18 @@ func (a *Action) Run(f func(*Action)) {
 	}
 }
 
+// collectMetricsPerSource retrieves metrics for the given source.
+func (a *Action) collectMetricsPerSource(m MetricsResult) error {
+	if _, ok := a.metricsPerSource[m.Source.Name]; !ok {
+		metrics, err := a.collectPrometheusMetrics(m.Source)
+		if err != nil {
+			return err
+		}
+		a.metricsPerSource[m.Source.Name] = metrics
+	}
+	return nil
+}
+
 // fail marks the Action as failed.
 func (a *Action) fail() {
 	a.failed = true
@@ -236,13 +272,33 @@ func (a *Action) ExecInPod(ctx context.Context, cmd []string) {
 	pod := a.src
 
 	a.Debug("Executing command", cmd)
-
-	output, err := pod.K8sClient.ExecInPod(ctx,
-		pod.Pod.Namespace, pod.Pod.Name, pod.Pod.Labels["name"], cmd)
-
 	cmdName := cmd[0]
 	cmdStr := strings.Join(cmd, " ")
-	a.cmdOutput = output.String()
+
+	var output bytes.Buffer
+	var err error
+	// We retry the command in case of inconclusive results. The result is
+	// deemed inconclusive when the command succeeded, but we don't have any
+	// output. We've seen this happen when there are connectivity blips on the
+	// k8s side.
+	// This check currently only works because all our test commands expect an
+	// output.
+	for i := 1; i <= testCommandRetries; i++ {
+		output, err = pod.K8sClient.ExecInPod(ctx,
+			pod.Pod.Namespace, pod.Pod.Name, pod.Pod.Labels["name"], cmd)
+		a.cmdOutput = output.String()
+		// Check for inconclusive results.
+		if err == nil && strings.TrimSpace(a.cmdOutput) == "" {
+			a.Debugf("retrying command %s due to inconclusive results", cmdStr)
+			continue
+		}
+		break
+	}
+	// Check for inconclusive results.
+	if err == nil && strings.TrimSpace(a.cmdOutput) == "" {
+		a.Failf("inconclusive results: command %q was successful but without output", cmdStr)
+	}
+
 	showOutput := false
 	expectedExitCode := a.expectedExitCode()
 	if err != nil {
@@ -309,7 +365,7 @@ func (a *Action) expectedExitCode() ExitCode {
 
 func (a *Action) printFlows(peer TestPeer) {
 	if len(a.flows) == 0 {
-		a.Logf("📄 No flows recorded during action %s", a.name)
+		a.Logf("📄 No flows recorded for peer %s during action %s", peer.Name(), a.name)
 		return
 	}
 
@@ -356,7 +412,7 @@ func (a *Action) printFlows(peer TestPeer) {
 	a.Log()
 }
 
-func (a *Action) matchFlowRequirements(ctx context.Context, flows flowsSet, req *filters.FlowSetRequirement) FlowRequirementResults {
+func (a *Action) matchFlowRequirements(flows flowsSet, req *filters.FlowSetRequirement) FlowRequirementResults {
 	var offset int
 	r := FlowRequirementResults{Failures: -1} // -1 to get the loop started
 
@@ -695,19 +751,40 @@ func (a *Action) GetIngressRequirements(p FlowParameters) []filters.FlowSetRequi
 	return []filters.FlowSetRequirement{ingress}
 }
 
-// waitForRelay polls the server status from Relay until either it's connected to all the Hubble
-// instances (success) or the context is cancelled (failure).
+func (a *Action) isRelayServerStatusOk(ctx context.Context, client observer.ObserverClient) bool {
+	// Sometimes ServerStatus request just gets stuck until the context gets cancelled. Call
+	// ServerStatus with a shorter timeout than ctx so that we get to try it multiple times.
+	timeoutContext, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	res, err := client.ServerStatus(timeoutContext, &observer.ServerStatusRequest{})
+	if err == nil {
+		a.Debugf("hubble relay server status %+v", res)
+		if (res.NumUnavailableNodes == nil || res.NumUnavailableNodes.Value == 0) && res.NumFlows > 0 {
+			// This means all the nodes are available, and Hubble Relay started receiving flows.
+			// Ideally we should check res.NumConnectedNodes matches the expected number of Cilium
+			// nodes instead of relying on res.NumUnavailableNodes, but I don't know if that information
+			// is available to us.
+			return true
+		}
+	} else {
+		a.Debugf("hubble relay server status failed: %v", err)
+	}
+	return false
+}
+
+// waitForRelay polls the server status from Relay until it indicates that there are no unavailable
+// nodes and num_flows is greater than zero (success), or the context is cancelled (failure).
 func (a *Action) waitForRelay(ctx context.Context, client observer.ObserverClient) error {
 	for {
-		res, err := client.ServerStatus(ctx, &observer.ServerStatusRequest{})
-		if err == nil && (res.NumUnavailableNodes == nil || res.NumUnavailableNodes.Value == 0) {
-			// This means all the nodes are available.
+		if a.isRelayServerStatusOk(ctx, client) {
+			a.Debug("hubble relay is ready")
 			return nil
 		}
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("hubble server status failure: %w", ctx.Err())
 		case <-time.After(time.Second):
+			a.Debug("retrying hubble relay server status request")
 		}
 	}
 }
@@ -733,10 +810,7 @@ func (a *Action) followFlows(ctx context.Context, ready chan bool) error {
 	// All tests are initiated from the source Pod, so filtering traffic
 	// originating from and destined to the Pod should capture what we need.
 	pod := a.Source()
-	filter := []*flow.FlowFilter{
-		{SourcePod: []string{pod.Name()}},
-		{DestinationPod: []string{pod.Name()}},
-	}
+	filter := pod.FlowFilters()
 
 	// Initiate long-poll against Hubble Relay.
 	b, err := hubbleClient.GetFlows(ctx, &observer.GetFlowsRequest{
@@ -815,7 +889,7 @@ func (a *Action) followFlows(ctx context.Context, ready chan bool) error {
 // matchAllFlowRequirements takes a list of flow requirements and matches each
 // of them against the flows logged against the Action up to this point.
 // Returns the merged verdict of all matcher operations using all requirements.
-func (a *Action) matchAllFlowRequirements(ctx context.Context, reqs []filters.FlowSetRequirement) FlowRequirementResults {
+func (a *Action) matchAllFlowRequirements(reqs []filters.FlowSetRequirement) FlowRequirementResults {
 	//TODO(timo): Reduce complexity of matcher output to make the surrounding logic
 	// easier to comprehend and modify. Different properties of the verdict should
 	// be exposed as methods, otherwise subtle bugs slip into the surrounding code
@@ -840,7 +914,7 @@ func (a *Action) matchAllFlowRequirements(ctx context.Context, reqs []filters.Fl
 	defer a.flowsMu.Unlock()
 
 	for i := range reqs {
-		res := a.matchFlowRequirements(ctx, a.flows, &reqs[i])
+		res := a.matchFlowRequirements(a.flows, &reqs[i])
 		//TODO(timo): The matcher should probably take in all requirements
 		// and return its verdict in a single struct.
 		out.Merge(&res)
@@ -906,7 +980,7 @@ func (a *Action) validateFlowsForPeer(ctx context.Context, reqs []filters.FlowSe
 			}
 			a.Debugf("Validating %d flows against %d requirements", len(a.flows), len(reqs))
 
-			res = a.matchAllFlowRequirements(ctx, reqs)
+			res = a.matchAllFlowRequirements(reqs)
 			if !res.NeedMoreFlows && res.FirstMatch != -1 {
 				// TODO(timo): This success condition should be a method on FlowRequirementResults.
 				return res
@@ -914,6 +988,76 @@ func (a *Action) validateFlowsForPeer(ctx context.Context, reqs []filters.FlowSe
 		case <-ctx.Done():
 			a.Fail("Aborting flow matching:", ctx.Err())
 			return res
+		}
+	}
+}
+func (a *Action) GetEgressMetricsRequirements() []MetricsResult {
+	return a.expEgress.Metrics
+}
+func (a *Action) GetIngressMetricsRequirements() []MetricsResult {
+	return a.expIngress.Metrics
+}
+
+const (
+	metricsCollectionTimeout      = time.Second * 30
+	metricCollectionIntervalRetry = time.Second * 5
+)
+
+// ValidateMetrics confronts the expected metrics against the last ones retrieves.
+func (a *Action) ValidateMetrics(ctx context.Context, pod Pod, results []MetricsResult) {
+	node := pod.NodeName()
+
+	if len(results) == 0 {
+		// Early exit.
+		a.Debugf("no metrics requirements to validate for this node %s", node)
+		return
+	}
+
+	for _, r := range results {
+		a.validateMetric(ctx, node, r)
+	}
+}
+
+func (a *Action) validateMetric(ctx context.Context, node string, result MetricsResult) {
+	if result.IsEmpty() {
+		a.Debugf("there is no source configured to retrieve metrics for node %s", node)
+		return
+	}
+
+	// ctx is used here as the duration of the retries to collect metrics.
+	ctx, cancel := context.WithTimeout(ctx, metricsCollectionTimeout)
+	defer cancel()
+
+	// ticker here is used as the interval duration before the next retry.
+	ticker := time.NewTicker(metricCollectionIntervalRetry)
+	defer ticker.Stop()
+
+	for {
+		// Collect the new metrics.
+		newMetrics, err := a.collectPrometheusMetricsForNode(result.Source, node)
+		if err != nil {
+			a.Failf("failed to collect new metrics on node %s: %w", node, err)
+			return
+		}
+
+		// Check the metrics comparing the first retrieved metrics and the new ones.
+		err = result.Assert(a.metricsPerSource[result.Source.Name][node], newMetrics)
+		if err != nil {
+			a.Debugf("failed to check metrics on node %s: %s\n", node, err)
+		} else {
+			// Metrics check succeed, let's exit.
+			a.Debugf("checked metrics properly on node %s: %s\n", node)
+			return
+
+		}
+
+		select {
+		case <-ctx.Done():
+			// Context timeout is reached, let's exit.
+			a.Failf("failed to collect metrics on node %s, context timeout: %w", node, ctx.Err().Error())
+			return
+		case <-ticker.C:
+			// Ticker is delivered, let's retry.
 		}
 	}
 }

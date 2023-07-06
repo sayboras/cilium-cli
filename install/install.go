@@ -43,6 +43,7 @@ import (
 
 const (
 	DatapathTunnel    = "tunnel"
+	DatapathNative    = "native"
 	DatapathAwsENI    = "aws-eni"
 	DatapathGKE       = "gke"
 	DatapathAzure     = "azure"
@@ -242,7 +243,7 @@ type k8sInstallerImplementation interface {
 	PatchDeployment(ctx context.Context, namespace, name string, pt types.PatchType, data []byte, opts metav1.PatchOptions) (*appsv1.Deployment, error)
 	CheckDeploymentStatus(ctx context.Context, namespace, deployment string) error
 	DeleteNamespace(ctx context.Context, namespace string, opts metav1.DeleteOptions) error
-	CreateNamespace(ctx context.Context, namespace string, opts metav1.CreateOptions) (*corev1.Namespace, error)
+	CreateNamespace(ctx context.Context, namespace *corev1.Namespace, opts metav1.CreateOptions) (*corev1.Namespace, error)
 	GetNamespace(ctx context.Context, namespace string, options metav1.GetOptions) (*corev1.Namespace, error)
 	ListPods(ctx context.Context, namespace string, options metav1.ListOptions) (*corev1.PodList, error)
 	DeletePod(ctx context.Context, namespace, name string, options metav1.DeleteOptions) error
@@ -262,6 +263,8 @@ type k8sInstallerImplementation interface {
 	GetPlatform(ctx context.Context) (*k8s.Platform, error)
 	GetServerVersion() (*semver.Version, error)
 	CreateIngressClass(ctx context.Context, r *networkingv1.IngressClass, opts metav1.CreateOptions) (*networkingv1.IngressClass, error)
+	GetIngress(ctx context.Context, namespace string, ingressName string, opts metav1.GetOptions) (*networkingv1.Ingress, error)
+	CreateIngress(ctx context.Context, namespace string, ingress *networkingv1.Ingress, opts metav1.CreateOptions) (*networkingv1.Ingress, error)
 	DeleteIngressClass(ctx context.Context, name string, opts metav1.DeleteOptions) error
 	CiliumLogs(ctx context.Context, namespace, pod string, since time.Time, filter *regexp.Regexp) (string, error)
 	ListAPIResources(ctx context.Context) ([]string, error)
@@ -398,6 +401,9 @@ type Parameters struct {
 	// DryRunHelmValues writes non-default Helm values to stdout without performing the actual installation.
 	// For Helm installation mode only.
 	DryRunHelmValues bool
+
+	// HelmRepository specifies the Helm repository to download Cilium Helm charts from.
+	HelmRepository string
 }
 
 type rollbackStep func(context.Context)
@@ -412,7 +418,10 @@ func (p *Parameters) validate() error {
 
 		p.configOverwrites[t[0]] = t[1]
 	}
-	if p.AgentImage != "" || p.OperatorImage != "" || p.RelayImage != "" {
+	if utils.IsInHelmMode() {
+		// Version validation logic does not apply to Helm mode.
+		return nil
+	} else if p.AgentImage != "" || p.OperatorImage != "" || p.RelayImage != "" {
 		return nil
 	} else if err := utils.CheckVersion(p.Version); err != nil {
 		return err
@@ -451,7 +460,7 @@ func NewK8sInstaller(client k8sInstallerImplementation, p Parameters) (*K8sInsta
 	}
 
 	cm := certs.NewCertManager(client, certs.Parameters{Namespace: p.Namespace})
-	chartVersion, helmChart, err := helm.ResolveHelmChartVersion(p.Version, p.HelmChartDirectory)
+	chartVersion, helmChart, err := helm.ResolveHelmChartVersion(p.Version, p.HelmChartDirectory, p.HelmRepository)
 	if err != nil {
 		return nil, err
 	}
@@ -621,23 +630,36 @@ func (k *K8sInstaller) listVersions() error {
 	return err
 }
 
+func getChainingMode(values map[string]interface{}) string {
+	cni, ok := values["cni"].(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	chainingMode, ok := cni["chainingMode"].(string)
+	if !ok {
+		return ""
+	}
+	return chainingMode
+}
+
 func (k *K8sInstaller) preinstall(ctx context.Context) error {
-	if err := k.autodetectAndValidate(ctx); err != nil {
+	// TODO (ajs): Note that we have our own implementation of helm MergeValues at internal/helm/MergeValues, used
+	//  e.g. in hubble.go. Does using the upstream HelmOpts.MergeValues here create inconsistencies with which
+	//  parameters take precedence? Test and determine which we should use here for expected behavior.
+	// Get Helm values to check if ipv4NativeRoutingCIDR value is specified via a Helm flag.
+	helmValues, err := k.params.HelmOpts.MergeValues(getter.All(cli.New()))
+	if err != nil {
+		return err
+	}
+
+	if err := k.autodetectAndValidate(ctx, helmValues); err != nil {
 		return err
 	}
 
 	switch k.flavor.Kind {
 	case k8s.KindGKE:
-		// TODO (ajs): Note that we have our own implementation of helm MergeValues at internal/helm/MergeValues, used
-		//  e.g. in hubble.go. Does using the upstream HelmOpts.MergeValues here create inconsistencies with which
-		//  parameters take precedence? Test and determine which we should use here for expected behavior.
-		// Get Helm values to check if ipv4NativeRoutingCIDR value is specified via a Helm flag.
-		helmValues, err := k.params.HelmOpts.MergeValues(getter.All(cli.New()))
-		if err != nil {
-			return err
-		}
 		if k.params.IPv4NativeRoutingCIDR == "" && helmValues["ipv4NativeRoutingCIDR"] == nil {
-			cidr, err := k.gkeNativeRoutingCIDR(ctx, k.client.ContextName())
+			cidr, err := k.gkeNativeRoutingCIDR(k.client.ContextName())
 			if err != nil {
 				k.Log("❌ Unable to auto-detect GKE native routing CIDR. Is \"gcloud\" installed?")
 				k.Log("ℹ️  You can set the native routing CIDR manually with --helm-set ipv4NativeRoutingCIDR=x.x.x.x/x")
@@ -649,11 +671,26 @@ func (k *K8sInstaller) preinstall(ctx context.Context) error {
 	case k8s.KindAKS:
 		if k.params.DatapathMode == DatapathAzure {
 			// The Azure Service Principal is only needed when using Azure IPAM
-			if err := k.azureSetupServicePrincipal(ctx); err != nil {
+			if err := k.azureSetupServicePrincipal(); err != nil {
 				return err
 			}
 		}
+	case k8s.KindEKS:
+		chainingMode := getChainingMode(helmValues)
+
+		// Do not stop AWS DS if we are running in chaining mode
+		if chainingMode != "aws-cni" {
+			if _, err := k.client.GetDaemonSet(ctx, AwsNodeDaemonSetNamespace, AwsNodeDaemonSetName, metav1.GetOptions{}); err == nil {
+				k.Log("🔥 Patching the %q DaemonSet to evict its pods...", AwsNodeDaemonSetName)
+				patch := []byte(fmt.Sprintf(`{"spec":{"template":{"spec":{"nodeSelector":{"%s":"%s"}}}}}`, AwsNodeDaemonSetNodeSelectorKey, AwsNodeDaemonSetNodeSelectorValue))
+				if _, err := k.client.PatchDaemonSet(ctx, AwsNodeDaemonSetNamespace, AwsNodeDaemonSetName, types.StrategicMergePatchType, patch, metav1.PatchOptions{}); err != nil {
+					k.Log("❌ Unable to patch the %q DaemonSet", AwsNodeDaemonSetName)
+					return err
+				}
+			}
+		}
 	}
+
 	return nil
 }
 
@@ -694,23 +731,6 @@ func (k *K8sInstaller) Install(ctx context.Context) error {
 	}
 
 	switch k.flavor.Kind {
-	case k8s.KindEKS:
-		cm, err := k.generateConfigMap()
-		if err != nil {
-			return err
-		}
-		// Do not stop AWS DS if we are running in chaining mode
-		if cm.Data["cni-chaining-mode"] != "aws-cni" {
-			if _, err := k.client.GetDaemonSet(ctx, AwsNodeDaemonSetNamespace, AwsNodeDaemonSetName, metav1.GetOptions{}); err == nil {
-				k.Log("🔥 Patching the %q DaemonSet to evict its pods...", AwsNodeDaemonSetName)
-				patch := []byte(fmt.Sprintf(`{"spec":{"template":{"spec":{"nodeSelector":{"%s":"%s"}}}}}`, AwsNodeDaemonSetNodeSelectorKey, AwsNodeDaemonSetNodeSelectorValue))
-				if _, err := k.client.PatchDaemonSet(ctx, AwsNodeDaemonSetNamespace, AwsNodeDaemonSetName, types.StrategicMergePatchType, patch, metav1.PatchOptions{}); err != nil {
-					k.Log("❌ Unable to patch the %q DaemonSet", AwsNodeDaemonSetName)
-					return err
-				}
-			}
-		}
-
 	case k8s.KindAKS:
 		// We only made the secret-based azure installation available in >= 1.12.0
 		// Introduced in https://github.com/cilium/cilium/pull/18010
@@ -850,7 +870,8 @@ func (k *K8sInstaller) Install(ctx context.Context) error {
 
 	secretsNamespace := k.getSecretNamespace()
 	if len(secretsNamespace) != 0 {
-		if _, err := k.client.CreateNamespace(ctx, secretsNamespace, metav1.CreateOptions{}); err != nil {
+		namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: secretsNamespace}}
+		if _, err := k.client.CreateNamespace(ctx, namespace, metav1.CreateOptions{}); err != nil {
 			return err
 		}
 		k.pushRollbackStep(func(ctx context.Context) {
@@ -912,7 +933,7 @@ func (k *K8sInstaller) Install(ctx context.Context) error {
 	})
 
 	// Create the node-init daemonset if one is required for the current kind.
-	if needsNodeInit(k.flavor.Kind) {
+	if needsNodeInit(k.flavor.Kind, k.chartVersion) {
 		k.Log("🚀 Creating %s Node Init DaemonSet...", k.flavor.Kind.String())
 		ds := k.generateNodeInitDaemonSet(k.flavor.Kind)
 		if _, err := k.client.CreateDaemonSet(ctx, k.params.Namespace, ds, metav1.CreateOptions{}); err != nil {

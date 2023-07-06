@@ -21,6 +21,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/cilium/cilium-cli/defaults"
+	"github.com/cilium/cilium-cli/internal/helm"
+	"github.com/cilium/cilium-cli/internal/utils"
+	"github.com/cilium/cilium-cli/k8s"
 )
 
 const (
@@ -214,14 +217,18 @@ func (k *K8sStatusCollector) podCount(ctx context.Context, status *Status) error
 	return nil
 }
 
-func (k *K8sStatusCollector) daemonSetStatus(ctx context.Context, status *Status, name string) error {
+func (k *K8sStatusCollector) daemonSetStatus(ctx context.Context, status *Status, name string) (bool, error) {
 	daemonSet, err := k.client.GetDaemonSet(ctx, k.params.Namespace, name, metav1.GetOptions{})
+	if k8serrors.IsNotFound(err) {
+		return true, err
+	}
+
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	if daemonSet == nil {
-		return fmt.Errorf("DaemonSet %s is not available", name)
+		return false, fmt.Errorf("DaemonSet %s is not available", name)
 	}
 
 	stateCount := PodStateCount{Type: "DaemonSet"}
@@ -254,7 +261,7 @@ func (k *K8sStatusCollector) daemonSetStatus(ctx context.Context, status *Status
 		status.AddAggregatedError(name, name, fmt.Errorf("daemonset %s is rolling out - %d out of %d pods updated", name, daemonSet.Status.UpdatedNumberScheduled, daemonSet.Status.DesiredNumberScheduled))
 	}
 
-	return nil
+	return false, nil
 }
 
 type podStatusCallback func(ctx context.Context, status *Status, name string, pod *corev1.Pod)
@@ -368,7 +375,7 @@ func (k *K8sStatusCollector) status(ctx context.Context) *Status {
 		{
 			name: defaults.AgentDaemonSetName,
 			task: func(_ context.Context) error {
-				err := k.daemonSetStatus(ctx, status, defaults.AgentDaemonSetName)
+				_, err := k.daemonSetStatus(ctx, status, defaults.AgentDaemonSetName)
 				status.mutex.Lock()
 				defer status.mutex.Unlock()
 
@@ -378,6 +385,30 @@ func (k *K8sStatusCollector) status(ctx context.Context) *Status {
 				}
 
 				return err
+			},
+		},
+		{
+			name: defaults.EnvoyDaemonSetName,
+			task: func(_ context.Context) error {
+				disabled, err := k.daemonSetStatus(ctx, status, defaults.EnvoyDaemonSetName)
+				status.mutex.Lock()
+				defer status.mutex.Unlock()
+
+				if disabled {
+					status.SetDisabled(defaults.EnvoyDaemonSetName, defaults.EnvoyDaemonSetName, disabled)
+					return nil
+				}
+
+				if err != nil {
+					status.AddAggregatedError(defaults.EnvoyDaemonSetName, defaults.EnvoyDaemonSetName, err)
+					status.CollectionError(err)
+				}
+
+				if err := k.podStatus(ctx, status, defaults.EnvoyDaemonSetName, "name=cilium-envoy", nil); err != nil {
+					status.CollectionError(err)
+				}
+
+				return nil
 			},
 		},
 		{
@@ -504,6 +535,26 @@ func (k *K8sStatusCollector) status(ctx context.Context) *Status {
 				return nil
 			},
 		},
+	}
+
+	if utils.IsInHelmMode() {
+		tasks = append(tasks, statusTask{
+			name: "Helm chart version",
+			task: func(_ context.Context) error {
+				client, ok := k.client.(*k8s.Client)
+				if !ok {
+					return fmt.Errorf("failed to initialize Helm client")
+				}
+				release, err := helm.Get(client.RESTClientGetter, helm.GetParameters{
+					Namespace: k.params.Namespace,
+					Name:      defaults.HelmReleaseName,
+				})
+				if err != nil {
+					return err
+				}
+				status.HelmChartVersion = release.Chart.Metadata.Version
+				return nil
+			}})
 	}
 
 	// for the sake of sanity, don't get pod logs more than once

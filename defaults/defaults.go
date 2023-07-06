@@ -6,6 +6,9 @@ package defaults
 import "time"
 
 const (
+	// renovate: datasource=github-releases depName=cilium/cilium
+	Version = "v1.13.4"
+
 	AgentContainerName      = "cilium-agent"
 	AgentServiceAccountName = "cilium"
 	AgentClusterRoleName    = "cilium"
@@ -15,6 +18,9 @@ const (
 	AgentPodSelector        = "k8s-app=cilium"
 	AgentResourceQuota      = "cilium-resource-quota"
 	AgentImage              = "quay.io/cilium/cilium"
+
+	EnvoyDaemonSetName = "cilium-envoy"
+	EnvoyConfigMapName = "cilium-envoy-config"
 
 	CASecretName     = "cilium-ca"
 	CASecretKeyName  = "ca.key"
@@ -63,17 +69,26 @@ const (
 	ClusterMeshServerSecretName           = "clustermesh-apiserver-server-cert"
 	ClusterMeshAdminSecretName            = "clustermesh-apiserver-admin-cert"
 	ClusterMeshClientSecretName           = "clustermesh-apiserver-client-cert"
+	ClusterMeshRemoteSecretName           = "clustermesh-apiserver-remote-cert"
 	ClusterMeshExternalWorkloadSecretName = "clustermesh-apiserver-external-workload-cert"
+
+	SPIREServerStatefulSetName = "spire-server"
+	SPIREServerConfigMapName   = "spire-server"
+	SPIREAgentDaemonSetName    = "spire-agent"
+	SPIREAgentConfigMapName    = "spire-agent"
 
 	ConnectivityCheckNamespace = "cilium-test"
 
-	ConnectivityCheckAlpineCurlImage = "quay.io/cilium/alpine-curl:v1.6.0@sha256:408430f548a8390089b9b83020148b0ef80b0be1beb41a98a8bfe036709c196e"
-	ConnectivityPerformanceImage     = "quay.io/cilium/network-perf:a816f935930cb2b40ba43230643da4d5751a5711@sha256:679d3a370c696f63884da4557a4466f3b5569b4719bb4f86e8aac02fbe390eea"
-	ConnectivityCheckJSONMockImage   = "quay.io/cilium/json-mock:v1.3.4@sha256:d5fbc5d7762530b53af27b0ba247e61a2fa5da42c8b5a58956933fe6a6ce15b8"
-	ConnectivityDNSTestServerImage   = "docker.io/coredns/coredns:1.10.0@sha256:017727efcfeb7d053af68e51436ce8e65edbc6ca573720afb4f79c8594036955"
+	// renovate: datasource=docker
+	ConnectivityCheckAlpineCurlImage = "quay.io/cilium/alpine-curl:v1.7.0@sha256:ccd0ed9da1752bab88a807647ad3cec65d460d281ab88988b60d70148783e751"
+	// renovate: datasource=docker
+	ConnectivityPerformanceImage = "quay.io/cilium/network-perf:a816f935930cb2b40ba43230643da4d5751a5711@sha256:679d3a370c696f63884da4557a4466f3b5569b4719bb4f86e8aac02fbe390eea"
+	// renovate: datasource=docker
+	ConnectivityCheckJSONMockImage = "quay.io/cilium/json-mock:v1.3.5@sha256:d5dfd0044540cbe01ad6a1932cfb1913587f93cac4f145471ca04777f26342a4"
+	// renovate: datasource=docker
+	ConnectivityDNSTestServerImage = "docker.io/coredns/coredns:1.10.1@sha256:a0ead06651cf580044aeb0a0feba63591858fb2e43ade8c9dea45a6a89ae7e5e"
 
 	ConfigMapName = "cilium-config"
-	Version       = "v1.13.2"
 
 	StatusWaitDuration = 5 * time.Minute
 
@@ -85,8 +100,13 @@ const (
 
 	PolicyWaitTimeout = 15 * time.Second
 
+	ConnectRetry      = 3
+	ConnectRetryDelay = 3 * time.Second
+
 	ConnectTimeout = 2 * time.Second
 	RequestTimeout = 10 * time.Second
+
+	UninstallTimeout = 5 * time.Minute
 
 	IngressClassName        = "cilium"
 	IngressService          = "cilium-ingress"
@@ -100,6 +120,9 @@ const (
 	HelmChartVersionSecretKeyName = "io.cilium.chart-version"
 
 	CiliumNoScheduleLabel = "cilium.io/no-schedule"
+
+	// HelmRepository specifies Helm repository to download Cilium charts from.
+	HelmRepository = "https://helm.cilium.io"
 )
 
 var (
@@ -133,5 +156,13 @@ var (
 		"affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].key=" + CiliumNoScheduleLabel,
 		"affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].operator=NotIn",
 		"affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].values[0]=true",
+	}
+
+	// CiliumOperatorScheduleAffinity is the node affinity to prevent Cilium from being schedule on
+	// nodes labeled with CiliumNoScheduleLabel.
+	CiliumOperatorScheduleAffinity = []string{
+		"operator.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].key=" + CiliumNoScheduleLabel,
+		"operator.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].operator=NotIn",
+		"operator.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].values[0]=true",
 	}
 )

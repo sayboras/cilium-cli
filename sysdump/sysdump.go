@@ -40,12 +40,20 @@ type Options struct {
 	CiliumNamespace string
 	// The namespace Cilium operator is running in.
 	CiliumOperatorNamespace string
+	// The namespace Cilium SPIRE installation is running in.
+	CiliumSPIRENamespace string
 	// The labels used to target Cilium daemon set. Usually, this label is same as CiliumLabelSelector.
 	CiliumDaemonSetSelector string
+	// The labels used to target Cilium Envoy pods.
+	CiliumEnvoyLabelSelector string
 	// The labels used to target Cilium operator pods.
 	CiliumOperatorLabelSelector string
 	// The labels used to target 'clustermesh-apiserver' pods.
 	ClustermeshApiserverLabelSelector string
+	// The labels used to target Cilium SPIRE server pods.
+	CiliumSPIREServerLabelSelector string
+	// The labels used to target Cilium SPIRE agent pods.
+	CiliumSPIREAgentLabelSelector string
 	// Whether to enable debug logging.
 	Debug bool
 	// Whether to enable scraping profiling data.
@@ -177,6 +185,19 @@ func NewCollector(k KubernetesClient, o Options, startTime time.Time, cliVersion
 		c.Options.CiliumOperatorNamespace = ns
 	} else {
 		c.log("ℹ️  Cilium operator namespace: %s", c.Options.CiliumOperatorNamespace)
+	}
+
+	if c.Options.CiliumSPIRENamespace == "" {
+		if ns, err := detectCiliumSPIRENamespace(k); err != nil {
+			c.logDebug("Failed to detect Cilium SPIRE installation: %v", err)
+			c.log("ℹ️ Failed to detect Cilium SPIRE installation - using Cilium namespace as Cilium SPIRE namespace: %s", c.Options.CiliumOperatorNamespace)
+			c.Options.CiliumSPIRENamespace = c.Options.CiliumOperatorNamespace
+		} else {
+			c.log("🔮 Detected Cilium SPIRE installation in namespace %q", ns)
+			c.Options.CiliumSPIRENamespace = ns
+		}
+	} else {
+		c.log("ℹ️  Cilium SPIRE namespace: %s", c.Options.CiliumSPIRENamespace)
 	}
 
 	// Grab the Kubernetes nodes for the target cluster.
@@ -471,6 +492,20 @@ func (c *Collector) Run() error {
 			},
 		},
 		{
+			Description: "Collecting Cilium CIDR Groups",
+			Quick:       true,
+			Task: func(ctx context.Context) error {
+				v, err := c.Client.ListCiliumCIDRGroups(ctx, metav1.ListOptions{})
+				if err != nil {
+					return fmt.Errorf("failed to collect Cilium CIDR Groups: %w", err)
+				}
+				if err := c.WriteYAML(ciliumCIDRGroupsFileName, v); err != nil {
+					return fmt.Errorf("failed to write Cilium CIDR Groups to file: %w", err)
+				}
+				return nil
+			},
+		},
+		{
 			Description: "Collecting Cilium local redirect policies",
 			Quick:       true,
 			Task: func(ctx context.Context) error {
@@ -569,6 +604,20 @@ func (c *Collector) Run() error {
 			},
 		},
 		{
+			Description: "Collecting IngressClasses",
+			Quick:       true,
+			Task: func(ctx context.Context) error {
+				v, err := c.Client.ListIngressClasses(ctx, metav1.ListOptions{})
+				if err != nil {
+					return fmt.Errorf("failed to collect IngressClasses: %w", err)
+				}
+				if err := c.WriteYAML(ingressClassesFileName, v); err != nil {
+					return fmt.Errorf("failed to collect IngressClasses: %w", err)
+				}
+				return nil
+			},
+		},
+		{
 			Description: "Collecting CiliumClusterwideEnvoyConfigs",
 			Quick:       true,
 			Task: func(ctx context.Context) error {
@@ -614,7 +663,7 @@ func (c *Collector) Run() error {
 			Description: "Collecting Cilium LoadBalancer IP Pools",
 			Quick:       true,
 			Task: func(ctx context.Context) error {
-				v, err := c.Client.ListCiliumBGPPeeringPolicies(ctx, metav1.ListOptions{})
+				v, err := c.Client.ListCiliumLoadBalancerIPPools(ctx, metav1.ListOptions{})
 				if err != nil {
 					return fmt.Errorf("failed to collect Cilium LoadBalancer IP Pools: %w", err)
 				}
@@ -625,24 +674,32 @@ func (c *Collector) Run() error {
 			},
 		},
 		{
-			Description: "Collecting Cilium etcd secret",
+			Description: "Collecting Cilium Pod IP Pools",
 			Quick:       true,
 			Task: func(ctx context.Context) error {
-				v, err := c.Client.GetSecret(ctx, c.Options.CiliumNamespace, ciliumEtcdSecretsSecretName, metav1.GetOptions{})
+				v, err := c.Client.ListCiliumPodIPPools(ctx, metav1.ListOptions{})
+				if err != nil {
+					return fmt.Errorf("failed to collect Cilium Pod IP pools: %w", err)
+				}
+				if err := c.WriteYAML(ciliumPodIPPoolsFileName, v); err != nil {
+					return fmt.Errorf("failed to collect Cilium Pod IP pools: %w", err)
+				}
+				return nil
+			},
+		},
+		{
+			Description: fmt.Sprintf("Checking if %s exists in %s namespace", ciliumEtcdSecretsSecretName, c.Options.CiliumNamespace),
+			Quick:       true,
+			Task: func(ctx context.Context) error {
+				_, err := c.Client.GetSecret(ctx, c.Options.CiliumNamespace, ciliumEtcdSecretsSecretName, metav1.GetOptions{})
 				if err != nil {
 					if errors.IsNotFound(err) {
-						c.logDebug("Secret %q not found in namespace %q - this is expected when using the CRD KVStore", ciliumEtcdSecretsSecretName, c.Options.CiliumNamespace)
+						c.log("Secret %q not found in namespace %q - this is expected when using the CRD KVStore", ciliumEtcdSecretsSecretName, c.Options.CiliumNamespace)
 						return nil
 					}
 					return fmt.Errorf("failed to collect Cilium etcd secret: %w", err)
 				}
-				// Redact the actual values.
-				for k := range v.Data {
-					v.Data[k] = []byte(redacted)
-				}
-				if err := c.WriteYAML(ciliumEtcdSecretFileName, v); err != nil {
-					return fmt.Errorf("failed to collect Cilium etcd secret: %w", err)
-				}
+				c.log("Secret %q found in namespace %q", ciliumEtcdSecretsSecretName, c.Options.CiliumNamespace)
 				return nil
 			},
 		},
@@ -675,6 +732,38 @@ func (c *Collector) Run() error {
 				}
 				if err = c.WriteYAML(ciliumDaemonSetFileName, v); err != nil {
 					return fmt.Errorf("failed to collect the Cilium daemonsets: %w", err)
+				}
+				return nil
+			},
+		},
+		{
+			Description: "Collecting the Cilium Envoy configuration",
+			Quick:       true,
+			Task: func(ctx context.Context) error {
+				v, err := c.Client.GetConfigMap(ctx, c.Options.CiliumNamespace, ciliumEnvoyConfigMapName, metav1.GetOptions{})
+				if err != nil {
+					return fmt.Errorf("failed to collect the Cilium Envoy configuration: %w", err)
+				}
+				if err := c.WriteYAML(ciliumEnvoyConfigMapFileName, v); err != nil {
+					return fmt.Errorf("failed to collect the Cilium Envoy configuration: %w", err)
+				}
+				return nil
+			},
+		},
+		{
+			Description: "Collecting the Cilium Envoy daemonset",
+			Quick:       true,
+			Task: func(ctx context.Context) error {
+				v, err := c.Client.GetDaemonSet(ctx, c.Options.CiliumNamespace, ciliumEnvoyDaemonSetName, metav1.GetOptions{})
+				if err != nil {
+					if errors.IsNotFound(err) {
+						c.logWarn("Daemonset %q not found in namespace %q - this is expected if Envoy DaemonSet is not enabled", ciliumEnvoyDaemonSetName, c.Options.CiliumNamespace)
+						return nil
+					}
+					return fmt.Errorf("failed to collect the Cilium Envoy daemonset: %w", err)
+				}
+				if err := c.WriteYAML(ciliumEnvoyDaemonsetFileName, v); err != nil {
+					return fmt.Errorf("failed to collect the Cilium Envoy daemonset: %w", err)
 				}
 				return nil
 			},
@@ -790,7 +879,7 @@ func (c *Collector) Run() error {
 				if err != nil {
 					return fmt.Errorf("failed to list Cilium pods: %w", err)
 				}
-				if err := c.SubmitCniConflistSubtask(ctx, FilterPods(p, c.NodeList), ciliumAgentContainerName); err != nil {
+				if err := c.SubmitCniConflistSubtask(FilterPods(p, c.NodeList), ciliumAgentContainerName); err != nil {
 					return fmt.Errorf("failed to collect CNI configuration files: %w", err)
 				}
 				return nil
@@ -825,7 +914,7 @@ func (c *Collector) Run() error {
 				if err != nil {
 					return fmt.Errorf("failed to get Cilium pods: %w", err)
 				}
-				if err := c.SubmitGopsSubtasks(ctx, FilterPods(p, c.NodeList), ciliumAgentContainerName); err != nil {
+				if err := c.SubmitGopsSubtasks(FilterPods(p, c.NodeList), ciliumAgentContainerName); err != nil {
 					return fmt.Errorf("failed to collect Cilium gops: %w", err)
 				}
 				return nil
@@ -842,7 +931,7 @@ func (c *Collector) Run() error {
 				if err != nil {
 					return fmt.Errorf("failed to get Hubble pods: %w", err)
 				}
-				if err := c.SubmitGopsSubtasks(ctx, FilterPods(p, c.NodeList), hubbleContainerName); err != nil {
+				if err := c.SubmitGopsSubtasks(FilterPods(p, c.NodeList), hubbleContainerName); err != nil {
 					return fmt.Errorf("failed to collect Hubble gops: %w", err)
 				}
 				return nil
@@ -859,7 +948,7 @@ func (c *Collector) Run() error {
 				if err != nil {
 					return fmt.Errorf("failed to get Hubble Relay pods: %w", err)
 				}
-				if err := c.SubmitGopsSubtasks(ctx, FilterPods(p, c.NodeList), hubbleRelayContainerName); err != nil {
+				if err := c.SubmitGopsSubtasks(FilterPods(p, c.NodeList), hubbleRelayContainerName); err != nil {
 					return fmt.Errorf("failed to collect Hubble Relay gops: %w", err)
 				}
 				return nil
@@ -876,7 +965,7 @@ func (c *Collector) Run() error {
 				if err != nil {
 					return fmt.Errorf("failed to get Cilium pods: %w", err)
 				}
-				if err := c.submitCiliumBugtoolTasks(ctx, FilterPods(p, c.NodeList)); err != nil {
+				if err := c.submitCiliumBugtoolTasks(FilterPods(p, c.NodeList)); err != nil {
 					return fmt.Errorf("failed to collect 'cilium-bugtool': %w", err)
 				}
 				return nil
@@ -896,7 +985,7 @@ func (c *Collector) Run() error {
 				if err != nil {
 					return fmt.Errorf("failed to get profiling from Cilium pods: %w", err)
 				}
-				if err := c.SubmitProfilingGopsSubtasks(ctx, FilterPods(p, c.NodeList), ciliumAgentContainerName); err != nil {
+				if err := c.SubmitProfilingGopsSubtasks(FilterPods(p, c.NodeList), ciliumAgentContainerName); err != nil {
 					return fmt.Errorf("failed to collect profiling data from Cilium pods: %w", err)
 				}
 				return nil
@@ -913,8 +1002,25 @@ func (c *Collector) Run() error {
 				if err != nil {
 					return fmt.Errorf("failed to get logs from Cilium pods")
 				}
-				if err := c.SubmitLogsTasks(ctx, FilterPods(p, c.NodeList), c.Options.LogsSinceTime, c.Options.LogsLimitBytes); err != nil {
+				if err := c.SubmitLogsTasks(FilterPods(p, c.NodeList), c.Options.LogsSinceTime, c.Options.LogsLimitBytes); err != nil {
 					return fmt.Errorf("failed to collect logs from Cilium pods")
+				}
+				return nil
+			},
+		},
+		{
+			CreatesSubtasks: true,
+			Description:     "Collecting logs from Cilium Envoy pods",
+			Quick:           false,
+			Task: func(ctx context.Context) error {
+				p, err := c.Client.ListPods(ctx, c.Options.CiliumNamespace, metav1.ListOptions{
+					LabelSelector: c.Options.CiliumEnvoyLabelSelector,
+				})
+				if err != nil {
+					return fmt.Errorf("failed to get logs from Cilium Envoy pods")
+				}
+				if err := c.SubmitLogsTasks(FilterPods(p, c.NodeList), c.Options.LogsSinceTime, c.Options.LogsLimitBytes); err != nil {
+					return fmt.Errorf("failed to collect logs from Cilium Envoy pods")
 				}
 				return nil
 			},
@@ -930,7 +1036,7 @@ func (c *Collector) Run() error {
 				if err != nil {
 					return fmt.Errorf("failed to get logs from Cilium operator pods")
 				}
-				if err := c.SubmitLogsTasks(ctx, FilterPods(p, c.NodeList), c.Options.LogsSinceTime, c.Options.LogsLimitBytes); err != nil {
+				if err := c.SubmitLogsTasks(FilterPods(p, c.NodeList), c.Options.LogsSinceTime, c.Options.LogsLimitBytes); err != nil {
 					return fmt.Errorf("failed to collect logs from Cilium operator pods")
 				}
 				return nil
@@ -947,7 +1053,7 @@ func (c *Collector) Run() error {
 				if err != nil {
 					return fmt.Errorf("failed to get logs from 'clustermesh-apiserver' pods")
 				}
-				if err := c.SubmitLogsTasks(ctx, FilterPods(p, c.NodeList), c.Options.LogsSinceTime, c.Options.LogsLimitBytes); err != nil {
+				if err := c.SubmitLogsTasks(FilterPods(p, c.NodeList), c.Options.LogsSinceTime, c.Options.LogsLimitBytes); err != nil {
 					return fmt.Errorf("failed to collect logs from 'clustermesh-apiserver' pods")
 				}
 				return nil
@@ -964,7 +1070,7 @@ func (c *Collector) Run() error {
 				if err != nil {
 					return fmt.Errorf("failed to get logs from Hubble pods")
 				}
-				if err := c.SubmitLogsTasks(ctx, FilterPods(p, c.NodeList), c.Options.LogsSinceTime, c.Options.LogsLimitBytes); err != nil {
+				if err := c.SubmitLogsTasks(FilterPods(p, c.NodeList), c.Options.LogsSinceTime, c.Options.LogsLimitBytes); err != nil {
 					return fmt.Errorf("failed to collect logs from Hubble pods")
 				}
 				return nil
@@ -981,7 +1087,7 @@ func (c *Collector) Run() error {
 				if err != nil {
 					return fmt.Errorf("failed to get logs from Hubble Relay pods")
 				}
-				if err := c.SubmitLogsTasks(ctx, FilterPods(p, c.NodeList), c.Options.LogsSinceTime, c.Options.LogsLimitBytes); err != nil {
+				if err := c.SubmitLogsTasks(FilterPods(p, c.NodeList), c.Options.LogsSinceTime, c.Options.LogsLimitBytes); err != nil {
 					return fmt.Errorf("failed to collect logs from Hubble Relay pods")
 				}
 				return nil
@@ -998,7 +1104,7 @@ func (c *Collector) Run() error {
 				if err != nil {
 					return fmt.Errorf("failed to get logs from Hubble UI pods")
 				}
-				if err := c.SubmitLogsTasks(ctx, FilterPods(p, c.NodeList), c.Options.LogsSinceTime, c.Options.LogsLimitBytes); err != nil {
+				if err := c.SubmitLogsTasks(FilterPods(p, c.NodeList), c.Options.LogsSinceTime, c.Options.LogsLimitBytes); err != nil {
 					return fmt.Errorf("failed to collect logs from Hubble UI pods")
 				}
 				return nil
@@ -1015,8 +1121,116 @@ func (c *Collector) Run() error {
 				if err != nil {
 					return fmt.Errorf("failed to get Tetragon pods: %w", err)
 				}
-				if err := c.submitTetragonBugtoolTasks(ctx, FilterPods(p, c.NodeList)); err != nil {
+				if err := c.SubmitTetragonBugtoolTasks(FilterPods(p, c.NodeList),
+					DefaultTetragonAgentContainerName, DefaultTetragonBugtoolPrefix,
+					DefaultTetragonCLICommand); err != nil {
 					return fmt.Errorf("failed to collect 'tetragon-bugtool': %w", err)
+				}
+				return nil
+			},
+		},
+		{
+			CreatesSubtasks: true,
+			Description:     "Collecting logs from Cilium SPIRE server pods",
+			Quick:           false,
+			Task: func(ctx context.Context) error {
+				p, err := c.Client.ListPods(ctx, c.Options.CiliumSPIRENamespace, metav1.ListOptions{
+					LabelSelector: c.Options.CiliumSPIREServerLabelSelector,
+				})
+				if err != nil {
+					return fmt.Errorf("failed to get logs from Cilium SPIRE server pods")
+				}
+				if err := c.SubmitLogsTasks(FilterPods(p, c.NodeList), c.Options.LogsSinceTime, c.Options.LogsLimitBytes); err != nil {
+					return fmt.Errorf("failed to collect logs from Cilium SPIRE server pods")
+				}
+				return nil
+			},
+		},
+		{
+			CreatesSubtasks: true,
+			Description:     "Collecting logs from Cilium SPIRE agent pods",
+			Quick:           false,
+			Task: func(ctx context.Context) error {
+				p, err := c.Client.ListPods(ctx, c.Options.CiliumSPIRENamespace, metav1.ListOptions{
+					LabelSelector: c.Options.CiliumSPIREAgentLabelSelector,
+				})
+				if err != nil {
+					return fmt.Errorf("failed to get logs from Cilium SPIRE agent pods")
+				}
+				if err := c.SubmitLogsTasks(FilterPods(p, c.NodeList), c.Options.LogsSinceTime, c.Options.LogsLimitBytes); err != nil {
+					return fmt.Errorf("failed to collect logs from Cilium SPIRE agent pods")
+				}
+				return nil
+			},
+		},
+		{
+			Description: "Collecting the Cilium SPIRE server statefulset",
+			Quick:       true,
+			Task: func(ctx context.Context) error {
+				v, err := c.Client.GetStatefulSet(ctx, c.Options.CiliumSPIRENamespace, ciliumSPIREServerStatefulSetName, metav1.GetOptions{})
+				if err != nil {
+					if errors.IsNotFound(err) {
+						c.logWarn("StatefulSet %q not found in namespace %q - this is expected if SPIRE installation is not enabled", ciliumSPIREServerStatefulSetName, c.Options.CiliumSPIRENamespace)
+						return nil
+					}
+					return fmt.Errorf("failed to collect the Cilium SPIRE server statefulset: %w", err)
+				}
+				if err := c.WriteYAML(ciliumSPIREServerStatefulSetFileName, v); err != nil {
+					return fmt.Errorf("failed to collect the Cilium SPIRE server statefulset: %w", err)
+				}
+				return nil
+			},
+		},
+		{
+			Description: "Collecting the Cilium SPIRE agent daemonset",
+			Quick:       true,
+			Task: func(ctx context.Context) error {
+				v, err := c.Client.GetDaemonSet(ctx, c.Options.CiliumSPIRENamespace, ciliumSPIREAgentDaemonSetName, metav1.GetOptions{})
+				if err != nil {
+					if errors.IsNotFound(err) {
+						c.logWarn("Daemonset %q not found in namespace %q - this is expected if SPIRE installation is not enabled", ciliumSPIREAgentDaemonSetName, c.Options.CiliumSPIRENamespace)
+						return nil
+					}
+					return fmt.Errorf("failed to collect the Cilium SPIRE agent daemonset: %w", err)
+				}
+				if err := c.WriteYAML(ciliumSPIREAgentDaemonsetFileName, v); err != nil {
+					return fmt.Errorf("failed to collect the Cilium SPIRE agent daemonset: %w", err)
+				}
+				return nil
+			},
+		},
+		{
+			Description: "Collecting the Cilium SPIRE agent configuration",
+			Quick:       true,
+			Task: func(ctx context.Context) error {
+				v, err := c.Client.GetConfigMap(ctx, c.Options.CiliumSPIRENamespace, ciliumSPIREAgentConfigMapName, metav1.GetOptions{})
+				if err != nil {
+					if errors.IsNotFound(err) {
+						c.logWarn("ConfigMap %q not found in namespace %q - this is expected if SPIRE installation is not enabled", ciliumSPIREAgentConfigMapName, c.Options.CiliumSPIRENamespace)
+						return nil
+					}
+					return fmt.Errorf("failed to collect the Cilium SPIRE agent configuration: %w", err)
+				}
+				if err := c.WriteYAML(ciliumSPIREAgentConfigMapFileName, v); err != nil {
+					return fmt.Errorf("failed to collect the Cilium SPIRE agent configuration: %w", err)
+				}
+				return nil
+			},
+		},
+		{
+			Description: "Collecting the Cilium SPIRE server configuration",
+			Quick:       true,
+			Task: func(ctx context.Context) error {
+				v, err := c.Client.GetConfigMap(ctx, c.Options.CiliumSPIRENamespace, ciliumSPIREServerConfigMapName, metav1.GetOptions{})
+				if err != nil {
+					if errors.IsNotFound(err) {
+						c.logWarn("ConfigMap %q not found in namespace %q - this is expected if SPIRE installation is not enabled", ciliumSPIREServerConfigMapName, c.Options.CiliumSPIRENamespace)
+						return nil
+					}
+					return fmt.Errorf("failed to collect the Cilium SPIRE server configuration: %w", err)
+				}
+				if err := c.WriteYAML(ciliumSPIREServerConfigMapFileName, v); err != nil {
+					return fmt.Errorf("failed to collect the Cilium SPIRE server configuration: %w", err)
 				}
 				return nil
 			},
@@ -1028,7 +1242,7 @@ func (c *Collector) Run() error {
 			Task: func(ctx context.Context) error {
 				f := c.Client.AutodetectFlavor(ctx)
 				c.logDebug("Detected flavor %q", f.Kind)
-				if err := c.submitFlavorSpecificTasks(ctx, f); err != nil {
+				if err := c.submitFlavorSpecificTasks(f); err != nil {
 					return fmt.Errorf("failed to collect platform-specific data: %w", err)
 				}
 				return nil
@@ -1074,7 +1288,15 @@ func (c *Collector) Run() error {
 				if err != nil {
 					return fmt.Errorf("failed to collect Tetragon tracing policies: %w", err)
 				}
-				if err := c.WriteYAML(tetragonTracingPolicy, v); err != nil {
+				if err := c.WriteYAML(DefaultTetragonTracingPolicy, v); err != nil {
+					return fmt.Errorf("failed to collect Tetragon tracing policies: %w", err)
+				}
+
+				vn, err := c.Client.ListTetragonTracingPoliciesNamespaced(ctx, corev1.NamespaceAll, metav1.ListOptions{})
+				if err != nil {
+					return fmt.Errorf("failed to collect Tetragon namespaced tracing policies: %w", err)
+				}
+				if err := c.WriteYAML(DefaultTetragonTracingPolicyNamespaced, vn); err != nil {
 					return fmt.Errorf("failed to collect Tetragon tracing policies: %w", err)
 				}
 				return nil
@@ -1095,6 +1317,126 @@ func (c *Collector) Run() error {
 				return nil
 			},
 		},
+		{
+			Description: "Collecting GatewayClass entries",
+			Quick:       true,
+			Task: func(ctx context.Context) error {
+				n := corev1.NamespaceAll
+				v, err := c.Client.ListUnstructured(ctx, gatewayClass, &n, metav1.ListOptions{})
+				if err != nil {
+					return fmt.Errorf("failed to collect GatewayClass entries: %w", err)
+				}
+				if err := c.WriteYAML(gatewayClassesFileName, v); err != nil {
+					return fmt.Errorf("failed to collect GatewayClass entries: %w", err)
+				}
+				return nil
+			},
+		},
+		{
+			Description: "Collecting Gateway entries",
+			Quick:       true,
+			Task: func(ctx context.Context) error {
+				n := corev1.NamespaceAll
+				v, err := c.Client.ListUnstructured(ctx, gateway, &n, metav1.ListOptions{})
+				if err != nil {
+					return fmt.Errorf("failed to collect Gateway entries: %w", err)
+				}
+				if err := c.WriteYAML(gatewaysFileName, v); err != nil {
+					return fmt.Errorf("failed to collect Gateway entries: %w", err)
+				}
+				return nil
+			},
+		},
+		{
+			Description: "Collecting ReferenceGrant entries",
+			Quick:       true,
+			Task: func(ctx context.Context) error {
+				n := corev1.NamespaceAll
+				v, err := c.Client.ListUnstructured(ctx, referenceGrant, &n, metav1.ListOptions{})
+				if err != nil {
+					return fmt.Errorf("failed to collect ReferenceGrant entries: %w", err)
+				}
+				if err := c.WriteYAML(referenceGrantsFileName, v); err != nil {
+					return fmt.Errorf("failed to collect ReferenceGrant entries: %w", err)
+				}
+				return nil
+			},
+		},
+		{
+			Description: "Collecting HTTPRoute entries",
+			Quick:       true,
+			Task: func(ctx context.Context) error {
+				n := corev1.NamespaceAll
+				v, err := c.Client.ListUnstructured(ctx, httpRoute, &n, metav1.ListOptions{})
+				if err != nil {
+					return fmt.Errorf("failed to collect HTTPRoute entries: %w", err)
+				}
+				if err := c.WriteYAML(httpRoutesFileName, v); err != nil {
+					return fmt.Errorf("failed to collect HTTPRoute entries: %w", err)
+				}
+				return nil
+			},
+		},
+		{
+			Description: "Collecting TLSRoute entries",
+			Quick:       true,
+			Task: func(ctx context.Context) error {
+				n := corev1.NamespaceAll
+				v, err := c.Client.ListUnstructured(ctx, tlsRoute, &n, metav1.ListOptions{})
+				if err != nil {
+					return fmt.Errorf("failed to collect TLSRoute entries: %w", err)
+				}
+				if err := c.WriteYAML(tlsRoutesFileName, v); err != nil {
+					return fmt.Errorf("failed to collect TLSRoute entries: %w", err)
+				}
+				return nil
+			},
+		},
+		{
+			Description: "Collecting GRPCRoute entries",
+			Quick:       true,
+			Task: func(ctx context.Context) error {
+				n := corev1.NamespaceAll
+				v, err := c.Client.ListUnstructured(ctx, grpcRoute, &n, metav1.ListOptions{})
+				if err != nil {
+					return fmt.Errorf("failed to collect GRPCRoute entries: %w", err)
+				}
+				if err := c.WriteYAML(grpcRoutesFileName, v); err != nil {
+					return fmt.Errorf("failed to collect GRPCRoute entries: %w", err)
+				}
+				return nil
+			},
+		},
+		{
+			Description: "Collecting TCPRoute entries",
+			Quick:       true,
+			Task: func(ctx context.Context) error {
+				n := corev1.NamespaceAll
+				v, err := c.Client.ListUnstructured(ctx, tcpRoute, &n, metav1.ListOptions{})
+				if err != nil {
+					return fmt.Errorf("failed to collect TCPRoute entries: %w", err)
+				}
+				if err := c.WriteYAML(tcpRoutesFileName, v); err != nil {
+					return fmt.Errorf("failed to collect TCPRoute entries: %w", err)
+				}
+				return nil
+			},
+		},
+		{
+			Description: "Collecting UDPRoute entries",
+			Quick:       true,
+			Task: func(ctx context.Context) error {
+				n := corev1.NamespaceAll
+				v, err := c.Client.ListUnstructured(ctx, udpRoute, &n, metav1.ListOptions{})
+				if err != nil {
+					return fmt.Errorf("failed to collect UDPRoute entries: %w", err)
+				}
+				if err := c.WriteYAML(udpRoutesFileName, v); err != nil {
+					return fmt.Errorf("failed to collect UDPRoute entries: %w", err)
+				}
+				return nil
+			},
+		},
 	}
 	for _, selector := range c.Options.ExtraLabelSelectors {
 		tasks = append(tasks, Task{
@@ -1108,7 +1450,7 @@ func (c *Collector) Run() error {
 				if err != nil {
 					return fmt.Errorf("failed to get logs from pods matching selector %q", selector)
 				}
-				if err := c.SubmitLogsTasks(ctx, FilterPods(p, c.NodeList), c.Options.LogsSinceTime, c.Options.LogsLimitBytes); err != nil {
+				if err := c.SubmitLogsTasks(FilterPods(p, c.NodeList), c.Options.LogsSinceTime, c.Options.LogsLimitBytes); err != nil {
 					return fmt.Errorf("failed to collect logs from pods matching selector %q", selector)
 				}
 				return nil
@@ -1205,11 +1547,7 @@ func (c *Collector) Run() error {
 
 	// Create the zip file in the current directory.
 	c.log("🗳 Compiling sysdump")
-	p, err := os.Getwd()
-	if err != nil {
-		return fmt.Errorf("failed to get current directory: %w", err)
-	}
-	f := filepath.Join(p, c.replaceTimestamp(c.Options.OutputFileName)+".zip")
+	f := c.replaceTimestamp(c.Options.OutputFileName) + ".zip"
 	if err := archiver.Archive([]string{c.sysdumpDir}, f); err != nil {
 		return fmt.Errorf("failed to create zip file: %w", err)
 	}
@@ -1245,7 +1583,8 @@ func (c *Collector) shouldSkipTask(t Task) bool {
 	return c.Options.Quick && !t.Quick
 }
 
-func (c *Collector) submitTetragonBugtoolTasks(ctx context.Context, pods []*corev1.Pod) error {
+func (c *Collector) SubmitTetragonBugtoolTasks(pods []*corev1.Pod, tetragonAgentContainerName,
+	tetragonBugtoolPrefix, tetragonCLICommand string) error {
 	for _, p := range pods {
 		p := p
 		workerID := fmt.Sprintf("%s-%s", tetragonBugtoolPrefix, p.Name)
@@ -1263,7 +1602,7 @@ func (c *Collector) submitTetragonBugtoolTasks(ctx context.Context, pods []*core
 
 			tarGzFile := fmt.Sprintf("%s-%s.tar.gz", tetragonBugtoolPrefix, time.Now().Format(timeFormat))
 			// Run 'tetra bugtool' in the pod.
-			command := []string{tetragonCliCommand, "bugtool", "--out", tarGzFile}
+			command := []string{tetragonCLICommand, "bugtool", "--out", tarGzFile}
 
 			c.logDebug("Executing 'tetragon-bugtool' command: %v", command)
 			_, e, err := c.Client.ExecInPodWithStderr(ctx, p.Namespace, p.Name, containerName, command)
@@ -1304,7 +1643,7 @@ func (c *Collector) submitTetragonBugtoolTasks(ctx context.Context, pods []*core
 	return nil
 }
 
-func (c *Collector) submitCiliumBugtoolTasks(ctx context.Context, pods []*corev1.Pod) error {
+func (c *Collector) submitCiliumBugtoolTasks(pods []*corev1.Pod) error {
 	for _, p := range pods {
 		p := p
 		if err := c.Pool.Submit(fmt.Sprintf("cilium-bugtool-"+p.Name), func(ctx context.Context) error {
@@ -1443,7 +1782,7 @@ func extractGopsProfileData(output string) (string, error) {
 
 }
 
-func (c *Collector) SubmitCniConflistSubtask(ctx context.Context, pods []*corev1.Pod, containerName string) error {
+func (c *Collector) SubmitCniConflistSubtask(pods []*corev1.Pod, containerName string) error {
 	for _, p := range pods {
 		p := p
 		if err := c.Pool.Submit(fmt.Sprintf("cniconflist-%s", p.GetName()), func(ctx context.Context) error {
@@ -1497,7 +1836,7 @@ func (c *Collector) getGopsPID(ctx context.Context, pod *corev1.Pod, containerNa
 }
 
 // SubmitGopsSubtasks submits tasks to collect gops statistics from pods.
-func (c *Collector) SubmitGopsSubtasks(ctx context.Context, pods []*corev1.Pod, containerName string) error {
+func (c *Collector) SubmitGopsSubtasks(pods []*corev1.Pod, containerName string) error {
 	for _, p := range pods {
 		p := p
 		for _, g := range gopsStats {
@@ -1529,7 +1868,7 @@ func (c *Collector) SubmitGopsSubtasks(ctx context.Context, pods []*corev1.Pod, 
 }
 
 // SubmitProfilingGopsSubtasks submits tasks to collect profiling data from pods.
-func (c *Collector) SubmitProfilingGopsSubtasks(ctx context.Context, pods []*corev1.Pod, containerName string) error {
+func (c *Collector) SubmitProfilingGopsSubtasks(pods []*corev1.Pod, containerName string) error {
 	for _, p := range pods {
 		p := p
 		for _, g := range gopsProfiling {
@@ -1570,7 +1909,7 @@ func (c *Collector) SubmitProfilingGopsSubtasks(ctx context.Context, pods []*cor
 }
 
 // SubmitLogsTasks submits tasks to collect kubernetes logs from pods.
-func (c *Collector) SubmitLogsTasks(ctx context.Context, pods []*corev1.Pod, since time.Duration, limitBytes int64) error {
+func (c *Collector) SubmitLogsTasks(pods []*corev1.Pod, since time.Duration, limitBytes int64) error {
 	t := time.Now().Add(-since)
 	for _, p := range pods {
 		p := p
@@ -1612,7 +1951,7 @@ func (c *Collector) SubmitLogsTasks(ctx context.Context, pods []*corev1.Pod, sin
 	return nil
 }
 
-func (c *Collector) submitFlavorSpecificTasks(ctx context.Context, f k8s.Flavor) error {
+func (c *Collector) submitFlavorSpecificTasks(f k8s.Flavor) error {
 	switch f.Kind {
 	case k8s.KindEKS:
 		if err := c.Pool.Submit(awsNodeDaemonSetName, func(ctx context.Context) error {
@@ -1793,4 +2132,27 @@ func detectCiliumOperatorNamespace(k KubernetesClient) (string, error) {
 		return ns.Name, nil
 	}
 	return "", fmt.Errorf("failed to detect Cilium operator namespace, could not find Cilium installation in namespaces: %v", DefaultCiliumNamespaces)
+}
+
+func detectCiliumSPIRENamespace(k KubernetesClient) (string, error) {
+	for _, ns := range DefaultCiliumSPIRENamespaces {
+		ctx := context.Background()
+		ns, err := k.GetNamespace(ctx, ns, metav1.GetOptions{})
+		if errors.IsNotFound(err) {
+			continue
+		}
+		if err != nil {
+			return "", fmt.Errorf("failed to detect Cilium SPIRE namespace: %w", err)
+		}
+
+		_, err = k.GetDaemonSet(ctx, ns.Name, ciliumSPIREAgentDaemonSetName, metav1.GetOptions{})
+		if errors.IsNotFound(err) {
+			continue
+		}
+		if err != nil {
+			return "", fmt.Errorf("failed to check for Cilium SPIRE agent DaemonSet: %w", err)
+		}
+		return ns.Name, nil
+	}
+	return "", fmt.Errorf("failed to detect Cilium SPIRE namespace, could not find Cilium SPIRE installation in namespaces: %v", DefaultCiliumSPIRENamespaces)
 }

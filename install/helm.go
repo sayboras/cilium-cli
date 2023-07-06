@@ -159,7 +159,7 @@ func (k *K8sInstaller) getHelmValues() (map[string]interface{}, error) {
 			// TODO(gandro): Future versions of Cilium will remove the following
 			// two limitations, we will need to have set the config map values
 			// based on the installed Cilium version
-			if versioncheck.MustCompile("<=1.13.0")(k.chartVersion) {
+			if versioncheck.MustCompile("<1.14.0")(k.chartVersion) {
 				helmMapOpts["l7Proxy"] = "false"
 				k.Log("ℹ️  L7 proxy disabled due to Wireguard encryption")
 
@@ -169,22 +169,20 @@ func (k *K8sInstaller) getHelmValues() (map[string]interface{}, error) {
 			}
 		}
 
+		// Set nodeinit enabled option
+		if needsNodeInit(k.flavor.Kind, k.chartVersion) {
+			helmMapOpts["nodeinit.enabled"] = "true"
+		}
+
 		// Set Helm options specific to the detected Kubernetes cluster type
 		switch k.flavor.Kind {
 		case k8s.KindKind:
 			helmMapOpts["ipam.mode"] = ipamKubernetes
 
-		case k8s.KindEKS:
-			helmMapOpts["nodeinit.enabled"] = "true"
-
 		case k8s.KindGKE:
-			helmMapOpts["nodeinit.enabled"] = "true"
 			helmMapOpts["nodeinit.removeCbrBridge"] = "true"
 			helmMapOpts["nodeinit.reconfigureKubelet"] = "true"
 			helmMapOpts["cni.binPath"] = "/home/kubernetes/bin"
-
-		case k8s.KindAKS:
-			helmMapOpts["nodeinit.enabled"] = "true"
 
 		case k8s.KindMicrok8s:
 			helmMapOpts["cni.binPath"] = Microk8sSnapPath + "/opt/cni/bin"
@@ -293,6 +291,7 @@ func (k *K8sInstaller) getHelmValues() (map[string]interface{}, error) {
 	// "cilium.io/no-schedule=true"
 	if len(k.params.NodesWithoutCilium) != 0 {
 		k.params.HelmOpts.StringValues = append(k.params.HelmOpts.StringValues, defaults.CiliumScheduleAffinity...)
+		k.params.HelmOpts.StringValues = append(k.params.HelmOpts.StringValues, defaults.CiliumOperatorScheduleAffinity...)
 	}
 
 	// Store all the options passed by --config into helm extraConfig

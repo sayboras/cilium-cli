@@ -15,13 +15,14 @@ env:
   KIND_CONFIG: .github/kind-config.yaml
   TIMEOUT: 2m
   LOG_TIME: 30m
-  cilium_version: v1.13.2
+  # renovate: datasource=github-releases depName=cilium/cilium
+  cilium_version: v1.13.4
   kubectl_version: v1.23.6
 
 jobs:
   installation-and-connectivity:
     runs-on: ubuntu-22.04
-    timeout-minutes: 40
+    timeout-minutes: 50
     strategy:
       matrix:
         mode: ["classic", "helm"]
@@ -30,7 +31,7 @@ jobs:
         run: |
           echo "CILIUM_CLI_MODE=${{ matrix.mode }}" >> $GITHUB_ENV
       - name: Checkout
-        uses: actions/checkout@8e5e7e5ab8b370d6c329ec480221332ada57f0ab
+        uses: actions/checkout@c85c95e3d7251135ab7dc9ce3241c5835cc595a9 # v3.5.3
 
       - name: Install kubectl
         run: |
@@ -41,9 +42,10 @@ jobs:
           kubectl version --client
 
       - name: Set up Go
-        uses: actions/setup-go@4d34df0c2316fe8122ab82dc22947d607c0c91f9
+        uses: actions/setup-go@fac708d6674e30b6ba41289acaab6d4b75aa0753 # v4.0.1
         with:
-          go-version: 1.20.2
+          # renovate: datasource=golang-version depName=go
+          go-version: 1.20.5
 
       - name: Set up Go for root
         run: |
@@ -54,7 +56,7 @@ jobs:
         run: sudo make install
 
       - name: Create kind cluster
-        uses: helm/kind-action@d8ccf8fb623ce1bb360ae2f45f323d9d5c5e9f00
+        uses: helm/kind-action@fa81e57adff234b2908110485695db0f181f3c67 # v1.7.0
         with:
           version: ${{ env.KIND_VERSION }}
           config: ${{ env.KIND_CONFIG }}
@@ -72,60 +74,7 @@ jobs:
             kubectl label nodes "${node}" cilium.io/no-schedule=true
           done
 
-      # This is needed for the tests that run with nodes without Cilium.
-      - name: Install static routes
-        run: |
-          EXTERNAL_FROM_CIDRS=($(kubectl get nodes -o jsonpath='{range .items[*]}{.spec.podCIDR}{"\n"}{end}'))
-          EXTERNAL_NODE_IPS=() # Nodes IPs are collected to be passed to the Cilium CLI later on.
-
-          # Loop over each pod CIDR from all nodes.
-          for i in "${!EXTERNAL_FROM_CIDRS[@]}"; do
-            EXTERNAL_FROM_CIDR=${EXTERNAL_FROM_CIDRS[i]}
-
-            if [[ $EXTERNAL_FROM_CIDR =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]]; then
-              IP_FAMILY="v4"
-            elif [[ $EXTERNAL_FROM_CIDR =~ ^[0-9a-fA-F:]+/[0-9]+$ ]]; then
-              IP_FAMILY="v6"
-            else
-              echo "ERROR: Malformed pod CIDR '${EXTERNAL_FROM_CIDR}'" >&2
-              exit 1
-            fi
-
-            IFS=',' read -ra NODES_WITHOUT <<< "$NODES_WITHOUT_CILIUM" # Split by comma into an array
-            for WITHOUT in "${NODES_WITHOUT[@]}"; do
-              # Fetch node with a specific pod CIDR.
-              node=$(kubectl get nodes -o jsonpath="{range .items[?(@.spec.podCIDR == '$EXTERNAL_FROM_CIDR')]}{@.metadata.name}{end}")
-              if [[ -z "$node" ]]; then
-                echo "ERROR: Could not find node with .spec.podCIDR matching ${EXTERNAL_FROM_CIDR}" >&2
-                exit 1
-              fi
-              for NODE_IP in $(kubectl get node "$node" -o jsonpath="{.status.addresses[?(@.type == 'InternalIP')].address}"); do
-                # Skip if the node IP's family mismatches with pod CIDR's
-                # family. Cannot create a route with the gateway IP family
-                # mismatching the subnet.
-                if [[ "$IP_FAMILY" == "v4" && ! "$NODE_IP" =~ \. ]]; then
-                  continue
-                elif [[ "$IP_FAMILY" == "v6" && ! "$NODE_IP" =~ \: ]]; then
-                  continue
-                fi
-                # Install static route on the host, towards the pod CIDR via the node IP.
-                docker exec "$WITHOUT" ip route replace "${EXTERNAL_FROM_CIDR}" via "${NODE_IP}"
-                EXTERNAL_NODE_IPS+=("${NODE_IP}")
-              done
-            done
-          done
-
-          # Join the elements with a comma delimiter, or leave them unmodified
-          # if there's only one element so that it can be passed properly to
-          # the CLI.
-          if [[ ${#EXTERNAL_NODE_IPS[@]} -eq 1 ]]; then
-            EXTERNAL_NODE_IPS_PARAM="${EXTERNAL_NODE_IPS[0]}"
-          else
-            EXTERNAL_NODE_IPS_PARAM=$(IFS=','; echo "${EXTERNAL_NODE_IPS[*]}")
-          fi
-          echo "EXTERNAL_NODE_IPS_PARAM=${EXTERNAL_NODE_IPS_PARAM}" >> $GITHUB_ENV
-
-      # Install Cilium with HostPort support for extended connectivity test.
+      # Install Cilium with HostPort support and enables Prometheus for extended connectivity test.
       - name: Install Cilium
         run: |
           cilium install \
@@ -135,7 +84,8 @@ jobs:
             --helm-set bpf.monitorAggregation=none \
             --helm-set cni.chainingMode=portmap \
             --helm-set loadBalancer.l7.backend=envoy \
-            --helm-set tls.secretsBackend=k8s
+            --helm-set tls.secretsBackend=k8s \
+            --helm-set prometheus.enabled=true
 
       - name: Enable Relay
         run: |
@@ -152,12 +102,13 @@ jobs:
         run: |
           # Run the connectivity test in non-default namespace (i.e. not cilium-test)
           cilium connectivity test --debug --all-flows --test-namespace test-namespace \
-            --external-from-cidrs="${EXTERNAL_NODE_IPS_PARAM}" \
-            --collect-sysdump-on-failure
+            --include-unsafe-tests \
+            --collect-sysdump-on-failure --junit-file cilium-junit-${{ matrix.mode }}-1.xml \
+            --junit-property mode=${{ matrix.mode }} --junit-property type=no-tunnel
 
       - name: Uninstall cilium
         run: |
-          pkill -f "cilium.*hubble.*port-forward|kubectl.*port-forward.*hubble-relay"
+          pkill -f "cilium.*hubble.*port-forward|kubectl.*port-forward.*hubble-relay" || test $? -eq 1
           cilium uninstall --wait
 
       - name: Install Cilium with IPsec Encryption
@@ -194,9 +145,18 @@ jobs:
 
       - name: Connectivity test
         run: |
-          cilium connectivity test --debug --force-deploy --all-flows --test-namespace another-test-namespace \
-            --external-from-cidrs="${EXTERNAL_NODE_IPS_PARAM}" \
-            --collect-sysdump-on-failure
+          cilium connectivity test --debug --force-deploy --all-flows --test-namespace test-namespace \
+            --include-unsafe-tests \
+            --collect-sysdump-on-failure --junit-file cilium-junit-${{ matrix.mode }}-2.xml \
+            --junit-property mode=${{ matrix.mode }} --junit-property type=ipsec
+
+      - name: Upload JUnit
+        if: ${{ always() }}
+        uses: actions/upload-artifact@0b7f8abb1508181956e8e162db84b466c27e18ce # v3.1.2
+        with:
+          name: cilium-junits
+          path: cilium-junit*.xml
+          retention-days: 2
 
       - name: Cleanup
         if: ${{ always() }}
@@ -214,10 +174,167 @@ jobs:
             kubectl label nodes "${node}" cilium.io/no-schedule-
           done
 
-      - name: Upload Artifacts
+      - name: Upload sysdump
         if: ${{ !success() }}
-        uses: actions/upload-artifact@0b7f8abb1508181956e8e162db84b466c27e18ce
+        uses: actions/upload-artifact@0b7f8abb1508181956e8e162db84b466c27e18ce # v3.1.2
         with:
           name: cilium-sysdump-out.zip
           path: cilium-sysdump-out.zip
+          retention-days: 5
+
+  helm-upgrade-clustermesh:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 50
+
+    env:
+      CILIUM_CLI_MODE: helm
+      KIND_CONFIG_1: .github/kind-config-1.yaml
+      KIND_CONFIG_2: .github/kind-config-2.yaml
+      # helm/kind-action will override the "name:" provided in the kind config with "chart-testing" unless these are
+      # specified as inputs. These must also match the suffix here for CLUSTER1 and CLUSTER2.
+      CLUSTER_NAME_1: c.1
+      CLUSTER_NAME_2: c.2
+      CLUSTER1: kind-c.1
+      CLUSTER2: kind-c.2
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@c85c95e3d7251135ab7dc9ce3241c5835cc595a9 # v3.5.3
+
+      - name: Install kubectl
+        run: |
+          curl -sLO "https://dl.k8s.io/release/${{ env.kubectl_version }}/bin/linux/amd64/kubectl"
+          curl -sLO "https://dl.k8s.io/${{ env.kubectl_version }}/bin/linux/amd64/kubectl.sha256"
+          echo "$(cat kubectl.sha256)  kubectl" | sha256sum --check
+          sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+          kubectl version --client
+
+      - name: Set up Go
+        uses: actions/setup-go@fac708d6674e30b6ba41289acaab6d4b75aa0753 # v4.0.1
+        with:
+          # renovate: datasource=golang-version depName=go
+          go-version: 1.20.5
+
+      - name: Set up Go for root
+        run: |
+          sudo ln -sf `which go` `sudo which go` || true
+          sudo go version
+
+      - name: Build and install cilium CLI binary
+        run: sudo make install
+
+      - name: Create kind cluster 1
+        uses: helm/kind-action@fa81e57adff234b2908110485695db0f181f3c67 # v1.7.0
+        with:
+          version: ${{ env.KIND_VERSION }}
+          config: ${{ env.KIND_CONFIG_1 }}
+          cluster_name: ${{ env.CLUSTER_NAME_1 }}
+
+      - name: Install Cilium on cluster 1
+        run: |
+          cilium install --context $CLUSTER1 \
+            --version=${{ env.cilium_version }} \
+            --wait=true \
+            --helm-set bpf.monitorAggregation=none \
+            --helm-set cni.chainingMode=portmap \
+            --helm-set cluster.id=1 \
+            --helm-set cluster.name=$CLUSTER1
+
+      - name: Create kind cluster 2
+        uses: helm/kind-action@fa81e57adff234b2908110485695db0f181f3c67 # v1.7.0
+        with:
+          version: ${{ env.KIND_VERSION }}
+          config: ${{ env.KIND_CONFIG_2 }}
+          cluster_name: ${{ env.CLUSTER_NAME_2 }}
+
+      - name: Install Cilium on cluster 2
+        run: |
+          cilium install --context $CLUSTER2 \
+            --version=${{ env.cilium_version }} \
+            --wait=true \
+            --helm-set bpf.monitorAggregation=none \
+            --helm-set cni.chainingMode=portmap \
+            --helm-set cluster.id=2 \
+            --helm-set cluster.name=$CLUSTER2
+
+      - name: Enable ClusterMesh on cluster 1 using helm-based upgrade
+        run: |
+          cilium upgrade --reuse-values --context $CLUSTER1 \
+            --wait=true \
+            --helm-set clustermesh.useAPIServer=true \
+            --helm-set clustermesh.apiserver.service.type=NodePort \
+            --helm-set clustermesh.apiserver.tls.server.extraDnsNames={"$CLUSTER1.mesh.cilium.io,$CLUSTER2.mesh.cilium.io"}
+
+      - name: Copy CA cert from cluster 1 to cluster 2
+        run: |
+          kubectl --context $CLUSTER2 delete secret -n kube-system cilium-ca && \
+          kubectl --context $CLUSTER1 get secrets -n kube-system cilium-ca -oyaml \
+            | kubectl --context $CLUSTER2 apply -f -
+          # Restart Cilium on cluster 2
+          kubectl --context $CLUSTER2 delete pod -l app.kubernetes.io/part-of=cilium -A
+
+      - name: Enable ClusterMesh on cluster 2 using helm-based upgrade
+        run: |
+          cilium upgrade --reuse-values --context $CLUSTER2 \
+            --wait=true \
+            --helm-set clustermesh.useAPIServer=true \
+            --helm-set clustermesh.apiserver.service.type=NodePort \
+            --helm-set clustermesh.apiserver.tls.server.extraDnsNames={"$CLUSTER1.mesh.cilium.io,$CLUSTER2.mesh.cilium.io"}
+
+      - name: Rename the secrets expected by the clustermesh connect command
+        run: |
+          kubectl get secrets --context $CLUSTER1 \
+            -n kube-system clustermesh-apiserver-remote-cert -oyaml \
+              | sed 's/name: .*/name: clustermesh-apiserver-client-cert/' \
+              | kubectl apply --context $CLUSTER1 -f -
+          kubectl get secrets --context $CLUSTER2 \
+            -n kube-system clustermesh-apiserver-remote-cert -oyaml \
+              | sed 's/name: .*/name: clustermesh-apiserver-client-cert/' \
+              | kubectl apply --context $CLUSTER2 -f -
+
+      - name: Connect the two clusters using clustermesh
+        run: |
+          cilium clustermesh connect --context $CLUSTER1 --destination-context $CLUSTER2
+          cilium clustermesh status --context $CLUSTER1 --wait
+
+      - name: Run the multicluster connectivity tests
+        run: |
+          cilium connectivity test --context $CLUSTER1 --multi-cluster $CLUSTER2 --debug \
+            --include-unsafe-tests \
+            --collect-sysdump-on-failure --junit-file cilium-junit-clustermesh-1.xml \
+            --junit-property mode=clustermesh --junit-property type=ipsec
+
+      - name: Upload JUnit
+        if: ${{ always() }}
+        uses: actions/upload-artifact@0b7f8abb1508181956e8e162db84b466c27e18ce # v3.1.2
+        with:
+          name: cilium-junits
+          path: cilium-junit*.xml
+          retention-days: 2
+
+      - name: Cleanup
+        if: ${{ always() }}
+        run: |
+          cilium --context $CLUSTER1 status
+          kubectl --context $CLUSTER1 get pods --all-namespaces -o wide
+          cilium --context $CLUSTER1 sysdump --output-filename cilium-sysdump-out-c1
+          cilium --context $CLUSTER2 status
+          kubectl --context $CLUSTER2 get pods --all-namespaces -o wide
+          cilium --context $CLUSTER2 sysdump --output-filename cilium-sysdump-out-c2
+        shell: bash {0} # Disable default fail-fast behaviour so that all commands run independently
+
+      - name: Upload sysdump from cluster 1
+        if: ${{ !success() }}
+        uses: actions/upload-artifact@0b7f8abb1508181956e8e162db84b466c27e18ce # v3.1.2
+        with:
+          name: cilium-sysdump-out-c1.zip
+          path: cilium-sysdump-out-c1.zip
+          retention-days: 5
+
+      - name: Upload sysdump from cluster 2
+        if: ${{ !success() }}
+        uses: actions/upload-artifact@0b7f8abb1508181956e8e162db84b466c27e18ce # v3.1.2
+        with:
+          name: cilium-sysdump-out-c2.zip
+          path: cilium-sysdump-out-c2.zip
           retention-days: 5

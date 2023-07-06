@@ -3,7 +3,7 @@ name: EKS (ENI)
 # Any change in triggers needs to be reflected in the concurrency group.
 on:
   ### FOR TESTING PURPOSES
-  # This workflow runs in the context of `master`, and ignores changes to
+  # This workflow runs in the context of `main`, and ignores changes to
   # workflow files in PRs. For testing changes to this workflow from a PR:
   # - Make sure the PR uses a branch from the base repository (requires write
   #   privileges). It will not work with a branch from a fork (missing secrets).
@@ -26,9 +26,9 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  clusterName: ${{ github.repository_owner }}-${{ github.event.repository.name }}-${{ github.run_id }}
   region: us-east-2
-  cilium_version: v1.13.2
+  # renovate: datasource=github-releases depName=cilium/cilium
+  cilium_version: v1.13.4
   kubectl_version: v1.23.6
 
 jobs:
@@ -36,9 +36,16 @@ jobs:
     if: ${{ github.repository == 'cilium/cilium-cli' }}
     runs-on: ubuntu-22.04
     timeout-minutes: 60
+    strategy:
+      matrix:
+        mode: ["classic", "helm"]
     steps:
+      - name: Set cluster name
+        run: |
+          echo "clusterName=${{ github.repository_owner }}-${{ github.event.repository.name }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.mode }}" >> $GITHUB_ENV
+
       - name: Checkout
-        uses: actions/checkout@8e5e7e5ab8b370d6c329ec480221332ada57f0ab
+        uses: actions/checkout@c85c95e3d7251135ab7dc9ce3241c5835cc595a9 # v3.5.3
 
       - name: Install kubectl
         run: |
@@ -55,7 +62,7 @@ jobs:
           rm eksctl_$(uname -s)_amd64.tar.gz
 
       - name: Install helm
-        uses: azure/setup-helm@5119fcb9089d432beecbf79bb2c7915207344b78
+        uses: azure/setup-helm@5119fcb9089d432beecbf79bb2c7915207344b78 # v3.5
         with:
           # Due to the below issue, v3.8.2 is pinned currently to avoid
           # exec plugin: invalid apiVersion "client.authentication.k8s.io/v1alpha1"
@@ -63,7 +70,7 @@ jobs:
           version: v3.8.2
 
       - name: Set up AWS CLI credentials
-        uses: aws-actions/configure-aws-credentials@e1e17a757e536f70e52b5a12b2e8d1d1c60e04ef
+        uses: aws-actions/configure-aws-credentials@5fd3084fc36e372ff1fff382a39b10d03659f355 # v2.2.0
         with:
           aws-access-key-id: ${{ secrets.AWS_PR_SA_ID }}
           aws-secret-access-key: ${{ secrets.AWS_PR_SA_KEY }}
@@ -133,7 +140,8 @@ jobs:
             --generate-name \
             --set tag=${{ steps.vars.outputs.sha }} \
             --set cilium_version=${{ env.cilium_version }} \
-            --set cluster_name=${{ env.clusterName }}
+            --set cluster_name=${{ env.clusterName }} \
+            --set cilium_cli_mode=${{ matrix.mode }}
 
       - name: Wait for job
         env:
@@ -183,7 +191,8 @@ jobs:
             --set tag=${{ steps.vars.outputs.sha }} \
             --set cluster_name=${{ env.clusterName }} \
             --set job_name=cilium-cli-uninstall \
-            --set test_script_cm=cilium-cli-test-script-uninstall
+            --set test_script_cm=cilium-cli-test-script-uninstall \
+            --set cilium_cli_mode=${{ matrix.mode }}
 
           # Background wait for job to complete or timeout
           kubectl -n kube-system wait job/cilium-cli-uninstall --for=condition=complete --timeout=${{ env.timeout }} &
@@ -210,7 +219,7 @@ jobs:
 
       - name: Upload artifacts
         if: ${{ !success() }}
-        uses: actions/upload-artifact@0b7f8abb1508181956e8e162db84b466c27e18ce
+        uses: actions/upload-artifact@0b7f8abb1508181956e8e162db84b466c27e18ce # v3.1.2
         with:
           name: cilium-sysdump-out.zip
           path: cilium-sysdump-out.zip

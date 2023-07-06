@@ -19,6 +19,13 @@ cilium install \
   --helm-set bpf.monitorAggregation=none \
   --helm-set ipv4NativeRoutingCIDR=10.0.0.0/9
 
+# Copy the CA cert from cluster1 to cluster2
+kubectl --context ${CONTEXT1} get secrets -n kube-system cilium-ca -oyaml \
+  | kubectl --context ${CONTEXT2} apply -f -
+
+# This seeds all CAs in cluster2 due to logic in the helm chart found here, e.g. for Hubble
+# https://github.com/cilium/cilium/blob/8b6aa6eda91927275ae722ac020deeb5a9ce479d/install/kubernetes/cilium/templates/hubble/tls-helm/_helpers.tpl#L24-L33
+
 # Install Cilium in cluster2
 cilium install \
   --version "${CILIUM_VERSION}" \
@@ -28,8 +35,7 @@ cilium install \
   --cluster-name "${CLUSTER_NAME_2}" \
   --helm-set cluster.id=2 \
   --helm-set bpf.monitorAggregation=none \
-  --helm-set ipv4NativeRoutingCIDR=10.0.0.0/9 \
-  --inherit-ca "${CONTEXT1}"
+  --helm-set ipv4NativeRoutingCIDR=10.0.0.0/9
 
 # Enable Relay
 cilium --context "${CONTEXT1}" hubble enable
@@ -41,12 +47,19 @@ cilium --context "${CONTEXT1}" status --wait
 cilium --context "${CONTEXT2}" status --wait
 
 # Enable cluster mesh
+# Test autodetection of service parameters for GKE
 cilium --context "${CONTEXT1}" clustermesh enable
 cilium --context "${CONTEXT2}" clustermesh enable
 
 # Wait for cluster mesh status to be ready
 cilium --context "${CONTEXT1}" clustermesh status --wait
 cilium --context "${CONTEXT2}" clustermesh status --wait
+
+# Print clustermesh Service annotations
+printf "Service annotations for Cluster 1 %s\n" \
+    $(kubectl --context "${CONTEXT1}" get svc -n kube-system clustermesh-apiserver -o jsonpath='{.metadata.annotations}')
+printf "Service annotations for Cluster 2 %s\n" \
+    $(kubectl --context "${CONTEXT2}" get svc -n kube-system clustermesh-apiserver -o jsonpath='{.metadata.annotations}')
 
 # Connect clusters
 cilium --context "${CONTEXT1}" clustermesh connect --destination-context "${CONTEXT2}"

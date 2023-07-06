@@ -144,9 +144,9 @@ func newCmdUninstall() *cobra.Command {
 				TestNamespace:   params.TestNamespace,
 				FlowValidation:  check.FlowValidationModeDisabled,
 				Writer:          os.Stdout,
-			}, Version)
+			}, version)
 			if err != nil {
-				fmt.Printf("⚠ ️ Failed to initialize connectivity test uninstaller: %s", err)
+				fmt.Printf("⚠ ️ Failed to initialize connectivity test uninstaller: %s\n", err)
 			} else {
 				cc.UninstallResources(ctx, params.Wait)
 			}
@@ -160,9 +160,9 @@ func newCmdUninstall() *cobra.Command {
 					HelmChartDirectory:   params.HelmChartDirectory,
 				})
 			if err != nil {
-				fmt.Printf("⚠ ️ Failed to initialize Hubble uninstaller: %s", err)
-			} else if h.Disable(ctx, true) != nil {
-				fmt.Printf("ℹ️  Failed to disable Hubble. This is expected if Hubble is not enabled: %s", err)
+				fmt.Printf("⚠ ️ Failed to initialize Hubble uninstaller: %s\n", err)
+			} else if err = h.Disable(ctx, true); err != nil {
+				fmt.Printf("ℹ️  Failed to disable Hubble: %s\n", err)
 			}
 			uninstaller := install.NewK8sUninstaller(k8sClient, params)
 			if err := uninstaller.Uninstall(context.Background()); err != nil {
@@ -228,7 +228,7 @@ func addCommonInstallFlags(cmd *cobra.Command, params *install.Parameters) {
 	cmd.Flags().StringVar(&params.ClusterName, "cluster-name", "", "Name of the cluster")
 	cmd.Flags().MarkDeprecated("cluster-name", "This can now be overridden via `helm-set` (Helm value: `cluster.name`).")
 	cmd.Flags().StringVar(&params.Version, "version", defaults.Version, "Cilium version to install")
-	cmd.Flags().StringVar(&params.DatapathMode, "datapath-mode", "", "Datapath mode to use { tunnel | aws-eni | gke | azure | aks-byocni } (default: autodetected).")
+	cmd.Flags().StringVar(&params.DatapathMode, "datapath-mode", "", "Datapath mode to use { tunnel | native | aws-eni | gke | azure | aks-byocni } (default: autodetected).")
 	cmd.Flags().BoolVar(&params.ListVersions, "list-versions", false, "List all the available versions without actually installing")
 	cmd.Flags().StringSliceVar(&params.NodesWithoutCilium, "nodes-without-cilium", []string{}, "List of node names on which Cilium will not be installed. In Helm installation mode, it's assumed that the no-schedule node labels are present and that the infastructure has set up routing on these nodes to provide connectivity within the Cilium cluster.")
 }
@@ -245,12 +245,13 @@ func addCommonUninstallFlags(cmd *cobra.Command, params *install.UninstallParame
 // flags are likely to be removed in the future.
 func addCommonHelmFlags(cmd *cobra.Command, params *install.Parameters) {
 	cmd.Flags().StringVar(&params.HelmChartDirectory, "chart-directory", "", "Helm chart directory")
-	cmd.Flags().StringSliceVar(&params.HelmOpts.ValueFiles, "helm-values", []string{}, "Specify helm values in a YAML file or a URL (can specify multiple)")
+	cmd.Flags().StringSliceVarP(&params.HelmOpts.ValueFiles, "helm-values", "f", []string{}, "Specify helm values in a YAML file or a URL (can specify multiple)")
 	cmd.Flags().StringArrayVar(&params.HelmOpts.Values, "helm-set", []string{}, "Set helm values on the command line (can specify multiple or separate values with commas: key1=val1,key2=val2)")
 	cmd.Flags().StringArrayVar(&params.HelmOpts.StringValues, "helm-set-string", []string{}, "Set helm STRING values on the command line (can specify multiple or separate values with commas: key1=val1,key2=val2)")
 	cmd.Flags().StringArrayVar(&params.HelmOpts.FileValues, "helm-set-file", []string{}, "Set helm values from respective files specified via the command line (can specify multiple or separate values with commas: key1=path1,key2=path2)")
 	cmd.Flags().BoolVar(&params.Wait, "wait", false, "Wait for helm install to finish")
 	cmd.Flags().DurationVar(&params.WaitDuration, "wait-duration", defaults.StatusWaitDuration, "Maximum time to wait for status")
+	cmd.Flags().SetNormalizeFunc(normalizeFlags)
 }
 
 func newCmdInstallWithHelm() *cobra.Command {
@@ -291,6 +292,7 @@ cilium install --context kind-cluster1 --helm-set cluster.id=1 --helm-set cluste
 	addCommonHelmFlags(cmd, &params)
 	cmd.Flags().BoolVar(&params.DryRun, "dry-run", false, "Write resources to be installed to stdout without actually installing them")
 	cmd.Flags().BoolVar(&params.DryRunHelmValues, "dry-run-helm-values", false, "Write non-default Helm values to stdout without performing the actual installation")
+	cmd.Flags().StringVar(&params.HelmRepository, "repository", defaults.HelmRepository, "Helm chart repository to download Cilium charts from")
 	return cmd
 }
 
@@ -310,14 +312,14 @@ func newCmdUninstallWithHelm() *cobra.Command {
 				TestNamespace:   params.TestNamespace,
 				FlowValidation:  check.FlowValidationModeDisabled,
 				Writer:          os.Stdout,
-			}, Version)
+			}, version)
 			if err != nil {
-				fmt.Printf("⚠ ️ Failed to initialize connectivity test uninstaller: %s", err)
+				fmt.Printf("⚠ ️ Failed to initialize connectivity test uninstaller: %s\n", err)
 			} else {
 				cc.UninstallResources(ctx, params.Wait)
 			}
 			uninstaller := install.NewK8sUninstaller(k8sClient, params)
-			if err := uninstaller.UninstallWithHelm(k8sClient.RESTClientGetter); err != nil {
+			if err := uninstaller.UninstallWithHelm(ctx, k8sClient.RESTClientGetter); err != nil {
 				fatalf("Unable to uninstall Cilium:  %s", err)
 			}
 			return nil
@@ -325,6 +327,8 @@ func newCmdUninstallWithHelm() *cobra.Command {
 	}
 
 	addCommonUninstallFlags(cmd, &params)
+	cmd.Flags().DurationVar(&params.Timeout, "timeout", defaults.UninstallTimeout, "Maximum time to wait for resources to be deleted")
+
 	return cmd
 }
 
@@ -372,5 +376,20 @@ cilium upgrade --helm-set cluster.id=1 --helm-set cluster.name=cluster1
 		"Write resources to be installed to stdout without actually installing them")
 	cmd.Flags().BoolVar(&params.DryRunHelmValues, "dry-run-helm-values", false,
 		"Write non-default Helm values to stdout; without performing the actual upgrade")
+	cmd.Flags().StringVar(&params.HelmRepository, "repository", defaults.HelmRepository, "Helm chart repository to download Cilium charts from")
 	return cmd
+}
+
+func normalizeFlags(_ *pflag.FlagSet, name string) pflag.NormalizedName {
+	switch name {
+	case "helm-set":
+		name = "set"
+	case "helm-set-file":
+		name = "set-file"
+	case "helm-set-string":
+		name = "set-string"
+	case "helm-values":
+		name = "values"
+	}
+	return pflag.NormalizedName(name)
 }

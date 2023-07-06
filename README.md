@@ -6,7 +6,6 @@
 [![EKS (tunnel)](https://github.com/cilium/cilium-cli/actions/workflows/eks-tunnel.yaml/badge.svg)](https://github.com/cilium/cilium-cli/actions/workflows/eks-tunnel.yaml)
 [![GKE](https://github.com/cilium/cilium-cli/workflows/GKE/badge.svg)](https://github.com/cilium/cilium-cli/actions?query=workflow%3AGKE)
 [![AKS (BYOCNI)](https://github.com/cilium/cilium-cli/actions/workflows/aks-byocni.yaml/badge.svg)](https://github.com/cilium/cilium-cli/actions/workflows/aks-byocni.yaml)
-[![AKS (Azure IPAM)](https://github.com/cilium/cilium-cli/actions/workflows/aks-azure-ipam.yaml/badge.svg)](https://github.com/cilium/cilium-cli/actions/workflows/aks-azure-ipam.yaml)
 [![Multicluster](https://github.com/cilium/cilium-cli/workflows/Multicluster/badge.svg)](https://github.com/cilium/cilium-cli/actions?query=workflow%3AMulticluster)
 [![External Workloads](https://github.com/cilium/cilium-cli/actions/workflows/externalworkloads.yaml/badge.svg)](https://github.com/cilium/cilium-cli/actions/workflows/externalworkloads.yaml)
 
@@ -28,7 +27,7 @@ BINDIR=~/.local/bin make install
 Alternatively, to install the latest binary release:
 
 ```
-CILIUM_CLI_VERSION=$(curl -s https://raw.githubusercontent.com/cilium/cilium-cli/master/stable.txt)
+CILIUM_CLI_VERSION=$(curl -s https://raw.githubusercontent.com/cilium/cilium-cli/main/stable.txt)
 GOOS=$(go env GOOS)
 GOARCH=$(go env GOARCH)
 curl -L --remote-name-all https://github.com/cilium/cilium-cli/releases/download/${CILIUM_CLI_VERSION}/cilium-${GOOS}-${GOARCH}.tar.gz{,.sha256sum}
@@ -42,10 +41,15 @@ binary releases.
 
 ## Releases
 
-| Release                                                              | Release Date | Maintained | Supported Cilium Versions |
-|----------------------------------------------------------------------|--------------|------------|---------------------------|
-| [v0.13.2](https://github.com/cilium/cilium-cli/releases/tag/v0.13.2) | 2023-03-20   | Yes        | Cilium 1.11 and newer     |
-| [v0.10.7](https://github.com/cilium/cilium-cli/releases/tag/v0.10.7) | 2022-05-31   | No         | Cilium 1.10               |
+| Release                                                              | Maintained | Supported Cilium Versions   |
+|----------------------------------------------------------------------|------------|-----------------------------|
+| [v0.15.0](https://github.com/cilium/cilium-cli/releases/tag/v0.15.0) | Yes        | Cilium 1.14 and newer       |
+| [v0.14.8](https://github.com/cilium/cilium-cli/releases/tag/v0.14.8) | Yes        | Cilium 1.11, 1.12, and 1.13 |
+| [v0.10.7](https://github.com/cilium/cilium-cli/releases/tag/v0.10.7) | No         | Cilium 1.10                 |
+
+Please see [Experimental `helm` installation mode](#experimental-helm-installation-mode)
+section regarding our plan to migrate to the new `helm` installation mode and deprecate
+the current implementation.
 
 ## Capabilities
 
@@ -75,7 +79,7 @@ To install Cilium while automatically detected:
  - [x] EKS
  - [x] self-managed
  - [x] GKE
- - [x] AKS
+ - [x] AKS BYOCNI
  - [x] k3s
  - [ ] Rancher
 
@@ -99,18 +103,22 @@ To install Cilium while automatically detected:
 
     cilium status
         /¯¯\
-     /¯¯\__/¯¯\    Cilium:      OK
-     \__/¯¯\__/    Operator:    OK
-     /¯¯\__/¯¯\    Hubble:      OK
-     \__/¯¯\__/
-        \__/
+     /¯¯\__/¯¯\    Cilium:             OK
+     \__/¯¯\__/    Operator:           OK
+     /¯¯\__/¯¯\    Envoy DaemonSet:    OK
+     \__/¯¯\__/    Hubble Relay:       OK
+        \__/       ClusterMesh:        disabled
+
     DaemonSet         cilium             Desired: 1, Ready: 1/1, Available: 1/1
+    DaemonSet         cilium-envoy       Desired: 1, Ready: 1/1, Available: 1/1
     Deployment        cilium-operator    Desired: 1, Ready: 1/1, Available: 1/1
     Deployment        hubble-relay       Desired: 1, Ready: 1/1, Available: 1/1
     Containers:       cilium             Running: 1
+                      cilium-envoy       Running: 1
                       cilium-operator    Running: 1
                       hubble-relay       Running: 1
     Image versions    cilium             quay.io/cilium/cilium:v1.9.1: 1
+                      cilium-envoy       quay.io/cilium/cilium-envoy:v1.25.5-37a98693f069413c82bef1724dd75dcf1b564fd9@sha256:d10841c9cc5b0822eeca4e3654929418b6424c978fd818868b429023f6cc215d: 1
                       cilium-operator    quay.io/cilium/operator-generic:v1.9.1: 1
                       hubble-relay       quay.io/cilium/hubble-relay:v1.9.1: 1
 
@@ -336,3 +344,97 @@ Install a Cilium in a cluster and enable encryption with IPsec
     🚀 Creating Agent DaemonSet...
     🚀 Creating Operator Deployment...
     ⌛ Waiting for Cilium to be installed...
+
+## `helm` installation mode
+
+`cilium-cli` v0.14 introduces a new `helm` installation mode. In the current installation mode
+(we now call it `classic` mode), `cilium-cli` directly calls Kubernetes APIs to manage resources
+related to Cilium. In the new `helm` mode, `cilium-cli` delegates all the installation state
+management to Helm. This enables you to use `cilium-cli` and `helm` interchangeably to manage your
+Cilium installation, while taking advantage of `cilium-cli`'s advanced features such as Cilium
+configuration auto-detection.
+
+In `cilium-cli` v0.15, the `helm` mode is the default installation mode, and the `classic` mode is
+deprecated. To use the `classic` mode, set `CILIUM_CLI_MODE` environment variable to `classic`:
+
+    export CILIUM_CLI_MODE=classic
+
+> **Warning**
+> The `classic` installation mode will be removed after v0.15 release.
+
+### Examples
+
+#### `install` examples
+
+To install the default version of Cilium:
+
+    cilium install
+
+To see the Helm release that got deployed:
+
+    helm list -n kube-system cilium
+
+To see non-default Helm values that `cilium-cli` used for this Cilium installation:
+
+    helm get values -n kube-system cilium
+
+To see all the Cilium-related resources without installing them to your cluster:
+
+    cilium install --dry-run
+
+To see all the non-default Helm values without actually performing the installation:
+
+    cilium install --dry-run-helm-values
+
+To install using Cilium's [OCI dev chart repository](https://quay.io/repository/cilium-charts-dev/cilium):
+
+    cilium install --repository oci://quay.io/cilium-charts-dev/cilium --version 1.14.0-dev-dev.4-main-797347707c
+
+#### `upgrade` examples
+
+To upgrade to a specific version of Cilium:
+
+    cilium upgrade --version v1.13.3
+
+To upgrade using a local Helm chart:
+
+    cilium upgrade --chart-directory ./install/kubernetes/cilium
+
+To upgrade using Cilium's [OCI dev chart repository](https://quay.io/repository/cilium-charts-dev/cilium):
+
+    cilium upgrade --repository oci://quay.io/cilium-charts-dev/cilium --version 1.14.0-dev-dev.4-main-797347707c
+
+Note that `upgrade` does not mean you can only upgrade to a newer version than what is
+currently installed. Similar to `helm upgrade`, `cilium upgrade` can be used to downgrade
+to a previous version. For example:
+
+     cilium install --version 1.13.3
+     cilium upgrade --version 1.12.10
+
+Please read [the upgrade guide](https://docs.cilium.io/en/stable/operations/upgrade/)
+carefully before upgrading Cilium to understand all the necessary steps. In particular,
+please note that `cilium-cli` does not automatically modify non-default Helm values during
+upgrade. You can use `--dry-run` and `--dry-run-helm-values` flags to review Kubernetes
+resources and non-default Helm values without actually performing an upgrade:
+
+To see the difference between the current Kubernetes resources in a live cluster and what would
+be applied:
+
+    cilium upgrade --version v1.13.3 --dry-run | kubectl diff -f -
+
+To see the non-default Helm values that would be used during upgrade:
+
+    cilium upgrade --version v1.13.3 --dry-run-helm-values
+
+> **Note**
+> You can use external diff tools such as [dyff](https://github.com/homeport/dyff) to make
+> `kubectl diff` output more readable.
+
+It is strongly recommended that you use Cilium's [OCI dev chart repository](https://quay.io/repository/cilium-charts-dev/cilium)
+if you need to deploy Cilium with a specific commit SHA. Alternatively, you can use `image.override`
+Helm value if you need to override the cilium-agent container image. For example:
+
+    cilium upgrade --helm-set image.override=quay.io/cilium/cilium-ci:103e277f78ce95e922bfac98f1e74138a411778a --reuse-values
+
+Please see Cilium's [Helm Reference](https://docs.cilium.io/en/stable/helm-reference/) for the
+complete list of Helm values.

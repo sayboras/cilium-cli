@@ -6,11 +6,14 @@ package check
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
+	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/blang/semver/v4"
@@ -24,6 +27,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/cilium/cilium-cli/defaults"
+	"github.com/cilium/cilium-cli/internal/junit"
 	"github.com/cilium/cilium-cli/k8s"
 )
 
@@ -38,7 +42,7 @@ type ConnectivityTest struct {
 	// CiliumVersion is the detected or assumed version of the Cilium agent
 	CiliumVersion semver.Version
 
-	features FeatureSet
+	Features FeatureSet
 
 	// Parameters to the test suite, specified by the CLI user.
 	params Parameters
@@ -51,11 +55,13 @@ type ConnectivityTest struct {
 
 	ciliumPods        map[string]Pod
 	echoPods          map[string]Pod
+	echoExternalPods  map[string]Pod
 	clientPods        map[string]Pod
 	perfClientPods    map[string]Pod
 	perfServerPod     map[string]Pod
 	PerfResults       map[PerfTests]PerfResult
 	echoServices      map[string]Service
+	ingressService    map[string]Service
 	externalWorkloads map[string]ExternalWorkload
 
 	hostNetNSPodsByNode map[string]Pod
@@ -65,8 +71,9 @@ type ConnectivityTest struct {
 
 	lastFlowTimestamps map[string]time.Time
 
-	nodes              map[string]*corev1.Node
-	nodesWithoutCilium []string
+	nodes                 map[string]*corev1.Node
+	nodesWithoutCilium    []string
+	nodesWithoutCiliumMap map[string]struct{}
 
 	manifests      map[string]string
 	helmYAMLValues string
@@ -178,11 +185,13 @@ func NewConnectivityTest(client *k8s.Client, p Parameters, version string) (*Con
 		version:             version,
 		ciliumPods:          make(map[string]Pod),
 		echoPods:            make(map[string]Pod),
+		echoExternalPods:    make(map[string]Pod),
 		clientPods:          make(map[string]Pod),
 		perfClientPods:      make(map[string]Pod),
 		perfServerPod:       make(map[string]Pod),
 		PerfResults:         make(map[PerfTests]PerfResult),
 		echoServices:        make(map[string]Service),
+		ingressService:      make(map[string]Service),
 		externalWorkloads:   make(map[string]ExternalWorkload),
 		hostNetNSPodsByNode: make(map[string]Pod),
 		nodes:               make(map[string]*corev1.Node),
@@ -214,6 +223,7 @@ func (ct *ConnectivityTest) NewTest(name string) *Test {
 		scenarios: make(map[Scenario][]*Action),
 		cnps:      make(map[string]*ciliumv2.CiliumNetworkPolicy),
 		knps:      make(map[string]*networkingv1.NetworkPolicy),
+		cegps:     make(map[string]*ciliumv2.CiliumEgressGatewayPolicy),
 		verbose:   ct.verbose(),
 		logBuf:    &bytes.Buffer{}, // maintain internal buffer by default
 		warnBuf:   &bytes.Buffer{},
@@ -229,6 +239,22 @@ func (ct *ConnectivityTest) NewTest(name string) *Test {
 	ct.testNames[name] = member
 
 	return t
+}
+
+// GetTest returns the test scope for test named "name" if found,
+// a non-nil error otherwise.
+func (ct *ConnectivityTest) GetTest(name string) (*Test, error) {
+	if _, ok := ct.testNames[name]; !ok {
+		return nil, fmt.Errorf("test %s not found", name)
+	}
+
+	for _, t := range ct.tests {
+		if t.name == name {
+			return t, nil
+		}
+	}
+
+	panic("missing test descriptor for a registered name")
 }
 
 // SetupAndValidate sets up and validates the connectivity test infrastructure
@@ -257,14 +283,14 @@ func (ct *ConnectivityTest) SetupAndValidate(ctx context.Context) error {
 	}
 
 	if ct.debug() {
-		fs := make([]Feature, 0, len(ct.features))
-		for f := range ct.features {
+		fs := make([]Feature, 0, len(ct.Features))
+		for f := range ct.Features {
 			fs = append(fs, f)
 		}
 		slices.Sort(fs)
 		ct.Debug("Detected features:")
 		for _, f := range fs {
-			ct.Debugf("  %s: %s", f, ct.features[f])
+			ct.Debugf("  %s: %s", f, ct.Features[f])
 		}
 	}
 
@@ -283,9 +309,13 @@ func (ct *ConnectivityTest) SetupAndValidate(ctx context.Context) error {
 			return fmt.Errorf("unable to create hubble client: %s", err)
 		}
 	}
-	if ct.features.MatchRequirements(RequireFeatureEnabled(FeatureNodeWithoutCilium)) {
-		if err := ct.validateExternalFromCIDRsWithNodesWithoutCilium(ctx); err != nil {
-			return fmt.Errorf("invalid configuration for nodes without Cilium: %w", err)
+	if ct.Features.MatchRequirements(RequireFeatureEnabled(FeatureNodeWithoutCilium)) {
+		if err := ct.detectPodCIDRs(ctx); err != nil {
+			return fmt.Errorf("unable to detect pod CIDRs: %w", err)
+		}
+
+		if err := ct.detectNodesWithoutCiliumIPs(); err != nil {
+			return fmt.Errorf("unable to detect nodes w/o Cilium IPs: %w", err)
 		}
 	}
 	return nil
@@ -350,6 +380,30 @@ func (ct *ConnectivityTest) Run(ctx context.Context) error {
 		<-done
 	}
 
+	if err := ct.writeJunit(); err != nil {
+		ct.Failf("writing to junit file %s failed: %s", ct.Params().JunitFile, err)
+	}
+
+	if ct.Params().FlushCT {
+		var wg sync.WaitGroup
+
+		wg.Add(len(ct.CiliumPods()))
+		for _, ciliumPod := range ct.CiliumPods() {
+			cmd := strings.Split("cilium bpf ct flush global", " ")
+			go func(ctx context.Context, pod Pod) {
+				defer wg.Done()
+
+				ct.Debugf("Flushing CT entries in %s/%s", pod.Pod.Namespace, pod.Pod.Name)
+				_, err := pod.K8sClient.ExecInPod(ctx, pod.Pod.Namespace, pod.Pod.Name, defaults.AgentContainerName, cmd)
+				if err != nil {
+					ct.Fatal("failed to flush ct entries: %w", err)
+				}
+			}(ctx, ciliumPod)
+		}
+
+		wg.Wait()
+	}
+
 	// Report the test results.
 	return ct.report()
 }
@@ -359,6 +413,83 @@ func (ct *ConnectivityTest) skip(t *Test) {
 	ct.Log()
 	ct.Logf("[=] Skipping Test [%s]", t.Name())
 	t.skipped = true
+}
+
+func (ct *ConnectivityTest) writeJunit() error {
+	if ct.Params().JunitFile == "" {
+		return nil
+	}
+
+	properties := []junit.Property{
+		{Name: "Args", Value: strings.Join(os.Args[3:], "|")},
+	}
+	for key, val := range ct.Params().JunitProperties {
+		properties = append(properties, junit.Property{Name: key, Value: val})
+	}
+
+	suite := &junit.TestSuite{
+		Name:    "connectivity test",
+		Package: "cilium",
+		Tests:   len(ct.tests),
+		Properties: &junit.Properties{
+			Properties: properties,
+		},
+	}
+
+	for i, t := range ct.tests {
+		test := &junit.TestCase{
+			Name:      t.Name(),
+			Classname: "connectivity test",
+			Status:    "passed",
+			Time:      t.completionTime.Sub(t.startTime).Seconds(),
+		}
+
+		// Timestamp of the TestSuite is the first test's start time
+		if i == 0 {
+			suite.Timestamp = t.startTime.Format("2006-01-02T15:04:05")
+		}
+		suite.Time += test.Time
+
+		if t.skipped {
+			test.Status = "skipped"
+			test.Skipped = &junit.Skipped{Message: t.Name() + " skipped"}
+			suite.Skipped++
+			test.Time = 0
+		} else if t.failed {
+			test.Status = "failed"
+			test.Failure = &junit.Failure{Message: t.Name() + " failed", Type: "failure"}
+			suite.Failures++
+			msgs := []string{}
+			for _, a := range t.failedActions() {
+				msgs = append(msgs, a.String())
+			}
+			test.Failure.Value = strings.Join(msgs, "\n")
+		}
+
+		suite.TestCases = append(suite.TestCases, test)
+	}
+
+	suites := junit.TestSuites{
+		Tests:      suite.Tests,
+		Disabled:   suite.Skipped,
+		Failures:   suite.Failures,
+		Time:       suite.Time,
+		TestSuites: []*junit.TestSuite{suite},
+	}
+
+	f, err := os.Create(ct.Params().JunitFile)
+	if err != nil {
+		return err
+	}
+
+	if err := suites.WriteReport(f); err != nil {
+		if e := f.Close(); e != nil {
+			return errors.Join(err, e)
+		}
+		return err
+	}
+
+	return f.Close()
 }
 
 func (ct *ConnectivityTest) report() error {
@@ -444,17 +575,62 @@ func (ct *ConnectivityTest) enableHubbleClient(ctx context.Context) error {
 	return nil
 }
 
-func (ct *ConnectivityTest) validateExternalFromCIDRsWithNodesWithoutCilium(ctx context.Context) error {
-	if len(ct.params.ExternalFromCIDRs) == 0 {
-		ct.Fatalf("--%s must not be empty if Cilium was install with --%s set", "external-from-cidrs", "nodes-without-cilium")
+func (ct *ConnectivityTest) detectPodCIDRs(ctx context.Context) error {
+	nodes, err := ct.client.ListNodes(ctx, metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to list nodes: %w", err)
 	}
-	for _, cidr := range ct.params.ExternalFromCIDRs {
-		addr, err := netip.ParseAddr(cidr)
-		if err != nil {
-			return fmt.Errorf("unable to parse external-from-cidr %q: %w", cidr, err)
+
+	for _, n := range nodes.Items {
+		for _, cidr := range n.Spec.PodCIDRs {
+			f := GetIPFamily(ct.hostNetNSPodsByNode[n.Name].Pod.Status.HostIP)
+			if strings.Contains(cidr, ":") && f == IPFamilyV4 {
+				// Skip if the host IP of the pod mismatches with pod CIDR.
+				// Cannot create a route with the gateway IP family
+				// mismatching the subnet.
+				continue
+			}
+			hostIP := ct.hostNetNSPodsByNode[n.Name].Pod.Status.HostIP
+			ct.params.PodCIDRs = append(ct.params.PodCIDRs, podCIDRs{cidr, hostIP})
 		}
-		ct.params.ExternalFromCIDRMasks = append(ct.params.ExternalFromCIDRMasks, addr.BitLen())
 	}
+
+	return nil
+}
+
+func (ct *ConnectivityTest) detectNodesWithoutCiliumIPs() error {
+	for _, n := range ct.nodesWithoutCilium {
+		pod := ct.hostNetNSPodsByNode[n]
+		for _, ip := range pod.Pod.Status.PodIPs {
+			hostIP, err := netip.ParseAddr(ip.IP)
+			if err != nil {
+				return fmt.Errorf("unable to parse nodes without Cilium IP addr %q: %w", ip.IP, err)
+			}
+			ct.params.NodesWithoutCiliumIPs = append(ct.params.NodesWithoutCiliumIPs,
+				nodesWithoutCiliumIP{ip.IP, hostIP.BitLen()})
+		}
+	}
+
+	return nil
+}
+
+func (ct *ConnectivityTest) modifyStaticRoutesForNodesWithoutCilium(ctx context.Context, verb string) error {
+	for _, e := range ct.params.PodCIDRs {
+		for _, withoutCilium := range ct.nodesWithoutCilium {
+			pod := ct.hostNetNSPodsByNode[withoutCilium]
+			_, err := ct.client.ExecInPod(ctx, pod.Pod.Namespace, pod.Pod.Name, hostNetNSDeploymentNameNonCilium,
+				[]string{"ip", "route", verb, e.CIDR, "via", e.HostIP},
+			)
+			ct.Debugf("Modifying (%s) static route on nodes without Cilium (%v): %v",
+				verb, withoutCilium,
+				[]string{"ip", "route", verb, e.CIDR, "via", e.HostIP},
+			)
+			if err != nil {
+				return fmt.Errorf("failed to %s static route: %w", verb, err)
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -615,9 +791,30 @@ func (ct *ConnectivityTest) CurlCommand(peer TestPeer, ipFam IPFamily, opts ...s
 	if requestTimeout := ct.params.RequestTimeout.Seconds(); requestTimeout > 0.0 {
 		cmd = append(cmd, "--max-time", strconv.FormatFloat(requestTimeout, 'f', -1, 64))
 	}
+	if ct.params.CurlInsecure {
+		cmd = append(cmd, "--insecure")
+	}
 
 	cmd = append(cmd, opts...)
 	cmd = append(cmd, fmt.Sprintf("%s://%s%s",
+		peer.Scheme(),
+		net.JoinHostPort(peer.Address(ipFam), fmt.Sprint(peer.Port())),
+		peer.Path()))
+	return cmd
+}
+
+func (ct *ConnectivityTest) CurlClientIPCommand(peer TestPeer, ipFam IPFamily, opts ...string) []string {
+	cmd := []string{"curl", "--silent", "--fail", "--show-error"}
+
+	if connectTimeout := ct.params.ConnectTimeout.Seconds(); connectTimeout > 0.0 {
+		cmd = append(cmd, "--connect-timeout", strconv.FormatFloat(connectTimeout, 'f', -1, 64))
+	}
+	if requestTimeout := ct.params.RequestTimeout.Seconds(); requestTimeout > 0.0 {
+		cmd = append(cmd, "--max-time", strconv.FormatFloat(requestTimeout, 'f', -1, 64))
+	}
+
+	cmd = append(cmd, opts...)
+	cmd = append(cmd, fmt.Sprintf("%s://%s%s/client-ip",
 		peer.Scheme(),
 		net.JoinHostPort(peer.Address(ipFam), fmt.Sprint(peer.Port())),
 		peer.Path()))
@@ -639,6 +836,13 @@ func (ct *ConnectivityTest) PingCommand(peer TestPeer, ipFam IPFamily) []string 
 	}
 
 	cmd = append(cmd, peer.Address(ipFam))
+	return cmd
+}
+
+func (ct *ConnectivityTest) DigCommand(peer TestPeer, ipFam IPFamily) []string {
+	cmd := []string{"dig", "+time=2", "kubernetes"}
+
+	cmd = append(cmd, fmt.Sprintf("@%s", peer.Address(ipFam)))
 	return cmd
 }
 
@@ -685,6 +889,14 @@ func (ct *ConnectivityTest) EchoServices() map[string]Service {
 	return ct.echoServices
 }
 
+func (ct *ConnectivityTest) ExternalEchoPods() map[string]Pod {
+	return ct.echoExternalPods
+}
+
+func (ct *ConnectivityTest) IngressService() map[string]Service {
+	return ct.ingressService
+}
+
 func (ct *ConnectivityTest) ExternalWorkloads() map[string]ExternalWorkload {
 	return ct.externalWorkloads
 }
@@ -702,7 +914,7 @@ func (ct *ConnectivityTest) AllFlows() bool {
 }
 
 func (ct *ConnectivityTest) FlowAggregation() bool {
-	return ct.features[FeatureMonitorAggregation].Enabled
+	return ct.Features[FeatureMonitorAggregation].Enabled
 }
 
 func (ct *ConnectivityTest) PostTestSleepDuration() time.Duration {
@@ -718,6 +930,10 @@ func (ct *ConnectivityTest) NodesWithoutCilium() []string {
 }
 
 func (ct *ConnectivityTest) Feature(f Feature) (FeatureStatus, bool) {
-	s, ok := ct.features[f]
+	s, ok := ct.Features[f]
 	return s, ok
+}
+
+func (ct *ConnectivityTest) Clients() []*k8s.Client {
+	return ct.clients.clients()
 }

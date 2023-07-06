@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/cilium/cilium-cli/internal/utils"
 	"github.com/cilium/cilium-cli/k8s"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -27,9 +28,6 @@ var (
 		},
 		k8s.KindKind: {
 			&kindVersionValidation{},
-		},
-		k8s.KindAKS: {
-			&azureVersionValidation{},
 		},
 	}
 
@@ -53,9 +51,31 @@ func (k *K8sUninstaller) autodetect(ctx context.Context) {
 	}
 }
 
-func (k *K8sInstaller) detectDatapathMode(ctx context.Context, withKPR bool) error {
+func (k *K8sInstaller) detectDatapathMode(withKPR bool) error {
 	if k.params.DatapathMode != "" {
 		k.Log("ℹ️  Custom datapath mode: %s", k.params.DatapathMode)
+		return nil
+	}
+
+	vals, err := k.getHelmValues()
+	if err != nil {
+		return err
+	}
+
+	routingMode := ""
+	for _, val := range vals {
+		val, ok := val.(string)
+		if ok && strings.HasPrefix(val, "routingMode") {
+			routingMode = strings.Split(val, "=")[1]
+		}
+
+	}
+	if routingMode == "native" {
+		k.params.DatapathMode = DatapathNative
+		return nil
+	}
+	if routingMode == "tunnel" {
+		k.params.DatapathMode = DatapathTunnel
 		return nil
 	}
 
@@ -76,7 +96,7 @@ func (k *K8sInstaller) detectDatapathMode(ctx context.Context, withKPR bool) err
 	case k8s.KindAKS:
 		// When on AKS, we need to determine if the cluster is in BYOCNI mode before
 		// determining which DatapathMode to use.
-		if err := k.azureAutodetect(ctx); err != nil {
+		if err := k.azureAutodetect(); err != nil {
 			return err
 		}
 
@@ -109,9 +129,20 @@ func (k *K8sInstaller) autodetect(ctx context.Context) {
 	}
 }
 
-func (k *K8sInstaller) autodetectAndValidate(ctx context.Context) error {
-	k.autodetect(ctx)
+func getClusterName(helmValues map[string]interface{}) string {
+	cluster, ok := helmValues["cluster"].(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	clusterName, ok := cluster["name"].(string)
+	if !ok {
+		return ""
+	}
+	return clusterName
+}
 
+func (k *K8sInstaller) autodetectAndValidate(ctx context.Context, helmValues map[string]interface{}) error {
+	k.autodetect(ctx)
 	if len(validationChecks[k.flavor.Kind]) > 0 {
 		k.Log("✨ Running %q validation checks", k.flavor.Kind)
 		for _, check := range validationChecks[k.flavor.Kind] {
@@ -131,15 +162,23 @@ func (k *K8sInstaller) autodetectAndValidate(ctx context.Context) error {
 
 	k.Log("ℹ️  Using Cilium version %s", k.chartVersion)
 
+	// "cluster.name" Helm value takes precedence over --cluster-name flag.
+	clusterName := getClusterName(helmValues)
+	if clusterName != "" {
+		k.params.ClusterName = clusterName
+	}
+
 	if k.params.ClusterName == "" {
 		if k.flavor.ClusterName != "" {
 			name := strings.ReplaceAll(k.flavor.ClusterName, "_", "-")
 			k.Log("🔮 Auto-detected cluster name: %s", name)
 			k.params.ClusterName = name
 		}
+	} else {
+		k.Log("ℹ️  Using cluster name %q", k.params.ClusterName)
 	}
 
-	if err := k.detectDatapathMode(ctx, true); err != nil {
+	if err := k.detectDatapathMode(true); err != nil {
 		return err
 	}
 
@@ -149,14 +188,16 @@ func (k *K8sInstaller) autodetectAndValidate(ctx context.Context) error {
 		k.Log("ℹ️  Custom IPAM mode: %s", k.params.IPAM)
 	}
 
-	if strings.Contains(k.params.ClusterName, ".") {
-		k.Log("❌ Cluster name %q cannot contain dots", k.params.ClusterName)
-		return fmt.Errorf("invalid cluster name, dots are not allowed")
-	}
+	if !utils.IsInHelmMode() {
+		if strings.Contains(k.params.ClusterName, ".") {
+			k.Log("❌ Cluster name %q cannot contain dots", k.params.ClusterName)
+			return fmt.Errorf("invalid cluster name, dots are not allowed")
+		}
 
-	if !clusterNameValidation.MatchString(k.params.ClusterName) {
-		k.Log("❌ Cluster name %q is not valid, must match regular expression: %s", k.params.ClusterName, clusterNameValidation)
-		return fmt.Errorf("invalid cluster name")
+		if !clusterNameValidation.MatchString(k.params.ClusterName) {
+			k.Log("❌ Cluster name %q is not valid, must match regular expression: %s", k.params.ClusterName, clusterNameValidation)
+			return fmt.Errorf("invalid cluster name")
+		}
 	}
 
 	switch k.params.Encryption {
@@ -171,8 +212,7 @@ func (k *K8sInstaller) autodetectAndValidate(ctx context.Context) error {
 	}
 
 	k.autodetectKubeProxy(ctx)
-	k.autoEnableBPFMasq()
-	return nil
+	return k.autoEnableBPFMasq()
 }
 
 func (k *K8sInstaller) autodetectKubeProxy(ctx context.Context) error {
@@ -242,12 +282,22 @@ func (k *K8sInstaller) autodetectKubeProxy(ctx context.Context) error {
 	return nil
 }
 
-func (k *K8sInstaller) autoEnableBPFMasq() {
+func (k *K8sInstaller) autoEnableBPFMasq() error {
+	vals, err := k.getHelmValues()
+	if err != nil {
+		return err
+	}
+
 	// Auto-enable BPF masquerading if KPR=strict and IPv6=disabled
 	foundKPRStrict := k.params.KubeProxyReplacement == "strict"
 	foundMasq := false
 	enabledIPv6 := false
-	for _, param := range k.params.HelmOpts.Values {
+	for _, param := range vals {
+		param, ok := param.(string)
+		if !ok {
+			continue
+		}
+
 		if !foundKPRStrict && param == "kubeProxyReplacement=strict" {
 			foundKPRStrict = true
 			continue
@@ -266,4 +316,6 @@ func (k *K8sInstaller) autoEnableBPFMasq() {
 		k.params.HelmOpts.Values = append(k.params.HelmOpts.Values,
 			"bpf.masquerade=true")
 	}
+
+	return nil
 }

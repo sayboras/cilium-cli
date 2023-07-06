@@ -14,6 +14,7 @@ import (
 	"github.com/cilium/cilium/api/v1/models"
 
 	"github.com/cilium/cilium-cli/defaults"
+	"github.com/cilium/cilium-cli/internal/utils"
 )
 
 const (
@@ -105,6 +106,10 @@ type Status struct {
 	// CollectionErrors is the errors that accumulated while collecting the
 	// status
 	CollectionErrors []error `json:"collection_errors,omitempty"`
+
+	// HelmChartVersion is the Helm chart version that is currently installed.
+	// For Helm mode only.
+	HelmChartVersion string `json:"helm_chart_version,omitempty"`
 
 	mutex *sync.Mutex
 }
@@ -325,9 +330,9 @@ func (s *Status) Format() string {
 	fmt.Fprintf(w, Yellow+"    /¯¯\\\n")
 	fmt.Fprintf(w, Cyan+" /¯¯"+Yellow+"\\__/"+Green+"¯¯\\"+Reset+"\tCilium:\t"+s.statusSummary(defaults.AgentDaemonSetName)+"\n")
 	fmt.Fprintf(w, Cyan+" \\__"+Red+"/¯¯\\"+Green+"__/"+Reset+"\tOperator:\t"+s.statusSummary(defaults.OperatorDeploymentName)+"\n")
-	fmt.Fprintf(w, Green+" /¯¯"+Red+"\\__/"+Magenta+"¯¯\\"+Reset+"\tHubble Relay:\t"+s.statusSummary(defaults.RelayDeploymentName)+"\n")
-	fmt.Fprintf(w, Green+" \\__"+Blue+"/¯¯\\"+Magenta+"__/"+Reset+"\tClusterMesh:\t"+s.statusSummary(defaults.ClusterMeshDeploymentName)+"\n")
-	fmt.Fprintf(w, Blue+"    \\__/\n"+Reset)
+	fmt.Fprintf(w, Green+" /¯¯"+Red+"\\__/"+Magenta+"¯¯\\"+Reset+"\tEnvoy DaemonSet:\t"+envoyStatusSummary(s.statusSummary(defaults.EnvoyDaemonSetName))+"\n")
+	fmt.Fprintf(w, Green+" \\__"+Blue+"/¯¯\\"+Magenta+"__/"+Reset+"\tHubble Relay:\t"+s.statusSummary(defaults.RelayDeploymentName)+"\n")
+	fmt.Fprintf(w, Blue+Blue+Blue+"    \\__/"+Reset+"\tClusterMesh:\t"+s.statusSummary(defaults.ClusterMeshDeploymentName)+"\n")
 	fmt.Fprintf(w, "\n")
 
 	if len(s.PodState) > 0 {
@@ -346,6 +351,9 @@ func (s *Status) Format() string {
 
 	fmt.Fprintf(w, "Cluster Pods:\t%s\n", formatPodsCount(s.PodsCount))
 
+	if utils.IsInHelmMode() {
+		fmt.Fprintf(w, "Helm chart version:\t%s\n", s.HelmChartVersion)
+	}
 	if len(s.ImageCount) > 0 {
 		header := "Image versions"
 		for name, imageCount := range s.ImageCount {
@@ -379,4 +387,14 @@ func (s *Status) Format() string {
 	w.Flush()
 
 	return buf.String()
+}
+
+// envoyStatusSummary adds some more context to the default `disabled` - mainly to prevent confusion.
+// This might get removed once the DaemonSet mode becomes the only available option.
+func envoyStatusSummary(statusSummary string) string {
+	if strings.Contains(statusSummary, "disabled") {
+		return strings.Replace(statusSummary, "disabled", "disabled (using embedded mode)", 1)
+	}
+
+	return statusSummary
 }

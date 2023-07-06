@@ -9,6 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/cilium/cilium-cli/internal/utils"
 	"github.com/cilium/cilium-cli/k8s"
 )
 
@@ -17,9 +18,17 @@ var (
 	namespace   string
 
 	k8sClient *k8s.Client
+
+	// version is the version string of the cilium-cli itself
+	version string
 )
 
-func NewDefaultCiliumCommand() *cobra.Command {
+// SetVersion sets the version string for the cilium command
+func SetVersion(v string) {
+	version = v
+}
+
+func NewCiliumCommand(hooks Hooks) *cobra.Command {
 	cmd := &cobra.Command{
 		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
 			// return early for commands that don't require the kubernetes client
@@ -72,14 +81,14 @@ cilium connectivity test`,
 		newCmdBgp(),
 		newCmdClusterMesh(),
 		newCmdConfig(),
-		newCmdConnectivity(),
+		newCmdConnectivity(hooks),
 		newCmdContext(),
 		newCmdHubble(),
 		newCmdStatus(),
-		newCmdSysdump(),
+		newCmdSysdump(hooks),
 		newCmdVersion(),
 	)
-	if os.Getenv("CILIUM_CLI_MODE") == "helm" {
+	if utils.IsInHelmMode() {
 		cmd.AddCommand(
 			newCmdInstallWithHelm(),
 			newCmdUninstallWithHelm(),

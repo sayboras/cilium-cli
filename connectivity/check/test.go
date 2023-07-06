@@ -9,11 +9,15 @@ import (
 	_ "embed"
 	"fmt"
 	"io"
+	"net"
 	"sync"
 	"time"
 
+	"github.com/blang/semver/v4"
 	k8sConst "github.com/cilium/cilium/pkg/k8s/apis/cilium.io"
 	ciliumv2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
+	v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
+	"github.com/cilium/cilium/pkg/versioncheck"
 
 	"github.com/cilium/cilium-cli/defaults"
 	"github.com/cilium/cilium-cli/sysdump"
@@ -65,6 +69,13 @@ type Test struct {
 	// for this test to be run
 	requirements []FeatureRequirement
 
+	// installIPRoutesFromOutsideToPodCIDRs indicates that the test runner needs
+	// to install podCIDR => nodeIP routes before running the test
+	installIPRoutesFromOutsideToPodCIDRs bool
+
+	// requiredCiliumVSN is a required Cilium VSN for this test to be run
+	requiredCiliumVSN semver.Range
+
 	// Scenarios registered to this test.
 	scenarios map[Scenario][]*Action
 
@@ -78,16 +89,25 @@ type Test struct {
 	// Kubernetes Network Policies active during this test.
 	knps map[string]*networkingv1.NetworkPolicy
 
+	// Cilium Egress Gateway Policies active during this test.
+	cegps map[string]*v2.CiliumEgressGatewayPolicy
+
 	// Secrets that have to be present during the test.
 	secrets map[string]*corev1.Secret
 
 	// CA certificates of the certificates that have to be present during the test.
 	certificateCAs map[string][]byte
 
+	// List of callbacks to be executed before the test run as additional setup.
+	before []SetupFunc
+
 	expectFunc ExpectationsFunc
 
 	// Start time of the test.
 	startTime time.Time
+
+	// Completion time of the test.
+	completionTime time.Time
 
 	// Buffer to store output until it's flushed by a failure.
 	// Unused when run in verbose or debug mode.
@@ -126,7 +146,7 @@ func (t *Test) scenarioEnabled(s Scenario) bool {
 	}
 
 	return t.Context().params.testEnabled(t.scenarioName(s)) &&
-		t.Context().features.MatchRequirements(reqs...)
+		t.Context().Features.MatchRequirements(reqs...)
 }
 
 // Context returns the enclosing context of the Test.
@@ -149,6 +169,16 @@ func (t *Test) setup(ctx context.Context) error {
 		return fmt.Errorf("applying network policies: %w", err)
 	}
 
+	if t.installIPRoutesFromOutsideToPodCIDRs {
+		if err := t.Context().modifyStaticRoutesForNodesWithoutCilium(ctx, "add"); err != nil {
+			return fmt.Errorf("installing static routes: %w", err)
+		}
+
+		t.finalizers = append(t.finalizers, func() error {
+			return t.Context().modifyStaticRoutesForNodesWithoutCilium(ctx, "del")
+		})
+	}
+
 	return nil
 }
 
@@ -160,11 +190,16 @@ func (t *Test) skip(s Scenario) {
 }
 
 // willRun returns false if all of the Test's Scenarios will be skipped, or
-// if any of its FeatureRequirements does not match
+// if any of its FeatureRequirements does not match, or a required Cilium vsn
+// does not match.
 func (t *Test) willRun() bool {
 	var sc int
 
-	if !t.Context().features.MatchRequirements(t.requirements...) {
+	if !t.Context().Features.MatchRequirements(t.requirements...) {
+		return false
+	}
+
+	if t.requiredCiliumVSN != nil && !t.requiredCiliumVSN(t.Context().CiliumVersion) {
 		return false
 	}
 
@@ -215,11 +250,21 @@ func (t *Test) Run(ctx context.Context) error {
 
 	// Store start time of the Test.
 	t.startTime = time.Now()
+	// Store completion of the Test when function is returned
+	defer func() {
+		t.completionTime = time.Now()
+	}()
 
 	t.ctx.Logf("[=] Test [%s]", t.Name())
 
 	if err := t.setup(ctx); err != nil {
 		return fmt.Errorf("setting up test: %w", err)
+	}
+
+	for _, cb := range t.before {
+		if err := cb(ctx, t, t.ctx); err != nil {
+			return fmt.Errorf("additional test setup callback: %w", err)
+		}
 	}
 
 	if t.logBuf != nil {
@@ -375,6 +420,77 @@ func (t *Test) WithK8SPolicy(policy string) *Test {
 	return t
 }
 
+const (
+	NoExcludedCIDRs = iota
+	ExternalNodeExcludedCIDRs
+)
+
+// CiliumEgressGatewayPolicyParams is used to configure how a CiliumEgressGatewayPolicy template should be configured
+// before being applied.
+type CiliumEgressGatewayPolicyParams struct {
+	// ExcludedCIDRs controls how the ExcludedCIDRs property should be configured
+	ExcludedCIDRs int
+}
+
+// WithCiliumEgressGatewayPolicy takes a string containing a YAML policy
+// document and adds the cilium egress gateway polic(y)(ies) to the scope of the
+// Test, to be applied when the test starts running. When calling this method,
+// note that the egress gateway enabled feature requirement is applied directly
+// here.
+func (t *Test) WithCiliumEgressGatewayPolicy(policy string, params CiliumEgressGatewayPolicyParams) *Test {
+	pl, err := parseCiliumEgressGatewayPolicyYAML(policy)
+	if err != nil {
+		t.Fatalf("Parsing policy YAML: %s", err)
+	}
+
+	for i := range pl {
+		// Change the default test namespace as required.
+		for _, k := range []string{
+			k8sConst.PodNamespaceLabel,
+			kubernetesSourcedLabelPrefix + k8sConst.PodNamespaceLabel,
+			anySourceLabelPrefix + k8sConst.PodNamespaceLabel,
+		} {
+			for _, e := range pl[i].Spec.Selectors {
+				ps := e.PodSelector
+				if n, ok := ps.MatchLabels[k]; ok && n == defaults.ConnectivityCheckNamespace {
+					ps.MatchLabels[k] = t.ctx.params.TestNamespace
+				}
+			}
+		}
+
+		// Set the egress gateway node
+		egressGatewayNode := t.EgressGatewayNode()
+		if egressGatewayNode == "" {
+			t.Fatalf("Cannot find egress gateway node")
+		}
+
+		pl[i].Spec.EgressGateway.NodeSelector.MatchLabels["kubernetes.io/hostname"] = egressGatewayNode
+
+		// Set the excluded CIDRs
+		pl[i].Spec.ExcludedCIDRs = []v2.IPv4CIDR{}
+
+		switch params.ExcludedCIDRs {
+		case ExternalNodeExcludedCIDRs:
+			for _, nodeWithoutCiliumIP := range t.Context().params.NodesWithoutCiliumIPs {
+				if parsedIP := net.ParseIP(nodeWithoutCiliumIP.IP); parsedIP.To4() == nil {
+					continue
+				}
+
+				cidr := v2.IPv4CIDR(fmt.Sprintf("%s/32", nodeWithoutCiliumIP.IP))
+				pl[i].Spec.ExcludedCIDRs = append(pl[i].Spec.ExcludedCIDRs, cidr)
+			}
+		}
+	}
+
+	if err := t.addCEGPs(pl...); err != nil {
+		t.Fatalf("Adding CEGPs to cilium egress gateway policy context: %s", err)
+	}
+
+	t.WithFeatureRequirements(RequireFeatureEnabled(FeatureEgressGateway))
+
+	return t
+}
+
 // WithScenarios adds Scenarios to Test in the given order.
 func (t *Test) WithScenarios(sl ...Scenario) *Test {
 	// Disallow adding the same Scenario object multiple times.
@@ -410,6 +526,27 @@ func (t *Test) WithFeatureRequirements(reqs ...FeatureRequirement) *Test {
 			t.requirements = append(t.requirements, target)
 		}
 	}
+
+	return t
+}
+
+// WithIPRoutesFromOutsideToPodCIDRs instructs the test runner that
+// podCIDR => nodeIP routes needs to be installed on a node which doesn't run
+// Cilium before running the test (and removed after the test completion).
+func (t *Test) WithIPRoutesFromOutsideToPodCIDRs() *Test {
+	if !t.Context().Params().IncludeUnsafeTests {
+		t.Fatal("WithIPRoutesFromOutsideToPodCIDRs() requires enabling --include-unsafe-tests")
+	}
+
+	t.installIPRoutesFromOutsideToPodCIDRs = true
+
+	return t
+}
+
+// WithCiliumVersion adds a requirement for a Cilium vsn in order for the test
+// to run.
+func (t *Test) WithCiliumVersion(vsn string) *Test {
+	t.requiredCiliumVSN = versioncheck.MustCompile(vsn)
 
 	return t
 }
@@ -508,6 +645,23 @@ func (t *Test) WithCertificate(name, hostname string) *Test {
 	})
 }
 
+// SetupFunc is a callback meant to be called before running the test.
+// It performs additional setup needed to run tests.
+type SetupFunc func(ctx context.Context, t *Test, testCtx *ConnectivityTest) error
+
+// WithSetupFunc registers a SetupFunc callback to be executed just before
+// the test runs.
+func (t *Test) WithSetupFunc(f SetupFunc) *Test {
+	t.before = append(t.before, f)
+	return t
+}
+
+// WithFinalizer registers a finalizer to be executed when Run() returns.
+func (t *Test) WithFinalizer(f func() error) *Test {
+	t.finalizers = append(t.finalizers, f)
+	return t
+}
+
 // NewAction creates a new Action. s must be the Scenario the Action is created
 // for, name should be a visually-distinguishable name, src is the execution
 // Pod of the action, and dst is the network target the Action will connect to.
@@ -543,6 +697,20 @@ func (t *Test) NodesWithoutCilium() []string {
 	return t.ctx.NodesWithoutCilium()
 }
 
+// EgressGatewayNode returns the name of the node that is supposed to act as
+// egress gateway in the egress gateway tests.
+//
+// Currently the designated node is the one running the other=client client pod.
+func (t *Test) EgressGatewayNode() string {
+	for _, clientPod := range t.ctx.clientPods {
+		if clientPod.Pod.Labels["other"] == "client" {
+			return clientPod.Pod.Spec.NodeName
+		}
+	}
+
+	return ""
+}
+
 func (t *Test) collectSysdump() {
 	collector, err := sysdump.NewCollector(t.ctx.K8sClient(), t.ctx.params.SysdumpOptions, time.Now(), t.ctx.version)
 	if err != nil {
@@ -563,19 +731,19 @@ func (t *Test) ForEachIPFamily(do func(IPFamily)) {
 	// netpols installed (tracked in https://github.com/cilium/cilium/issues/23852
 	// and https://github.com/cilium/cilium/issues/23910). Once both issues
 	// are resolved, we can start testing IPv6 with netpols.
-	if f, ok := t.Context().Feature(FeatureEndpointRoutes); ok && f.Enabled && len(t.cnps) > 0 {
+	if f, ok := t.Context().Feature(FeatureEndpointRoutes); ok && f.Enabled && (len(t.cnps) > 0 || len(t.knps) > 0) {
 		ipFams = []IPFamily{IPFamilyV4}
 	}
 
 	for _, ipFam := range ipFams {
 		switch ipFam {
 		case IPFamilyV4:
-			if f, ok := t.ctx.features[FeatureIPv4]; ok && f.Enabled {
+			if f, ok := t.ctx.Features[FeatureIPv4]; ok && f.Enabled {
 				do(ipFam)
 			}
 
 		case IPFamilyV6:
-			if f, ok := t.ctx.features[FeatureIPv6]; ok && f.Enabled {
+			if f, ok := t.ctx.Features[FeatureIPv6]; ok && f.Enabled {
 				do(ipFam)
 			}
 		}
@@ -585,4 +753,12 @@ func (t *Test) ForEachIPFamily(do func(IPFamily)) {
 // CertificateCAs returns the CAs used to sign the certificates within the test.
 func (t *Test) CertificateCAs() map[string][]byte {
 	return t.certificateCAs
+}
+
+func (t *Test) CiliumNetworkPolicies() map[string]*ciliumv2.CiliumNetworkPolicy {
+	return t.cnps
+}
+
+func (t *Test) KubernetesNetworkPolicies() map[string]*networkingv1.NetworkPolicy {
+	return t.knps
 }

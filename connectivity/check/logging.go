@@ -20,6 +20,29 @@ const (
 	testPrefix = "  "
 )
 
+// Logger abstracts the logging functionalities implemented by the
+// test suite, individual tests and actions.
+type Logger interface {
+	// Log logs a message.
+	Log(a ...interface{})
+	// Logf logs a formatted message.
+	Logf(format string, a ...interface{})
+
+	// Debug logs a debug message.
+	Debug(a ...interface{})
+	// Debugf logs a formatted debug message.
+	Debugf(format string, a ...interface{})
+
+	// Info logs an informational message.
+	Info(a ...interface{})
+	// Infof logs a formatted informational message.
+	Infof(format string, a ...interface{})
+}
+
+var _ Logger = (*ConnectivityTest)(nil)
+var _ Logger = (*Test)(nil)
+var _ Logger = (*Action)(nil)
+
 //
 // Output methods on the global ConnectivityTest context.
 // These methods never buffer any lines and are sent directly to the
@@ -360,4 +383,22 @@ func (a *Action) Fatalf(format string, s ...interface{}) {
 
 func timestamp() string {
 	return fmt.Sprintf("[%s] ", time.Now().Format(time.RFC3339))
+}
+
+type debugWriter struct {
+	ct *ConnectivityTest
+}
+
+func (d *debugWriter) Write(b []byte) (int, error) {
+	d.ct.Debug(string(b))
+	return len(b), nil
+}
+
+type warnWriter struct {
+	ct *ConnectivityTest
+}
+
+func (w *warnWriter) Write(b []byte) (int, error) {
+	w.ct.Warn(string(b))
+	return len(b), nil
 }

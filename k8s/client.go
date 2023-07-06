@@ -315,8 +315,8 @@ func (c *Client) CheckDeploymentStatus(ctx context.Context, namespace, deploymen
 	return nil
 }
 
-func (c *Client) CreateNamespace(ctx context.Context, namespace string, opts metav1.CreateOptions) (*corev1.Namespace, error) {
-	return c.Clientset.CoreV1().Namespaces().Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}, opts)
+func (c *Client) CreateNamespace(ctx context.Context, namespace *corev1.Namespace, opts metav1.CreateOptions) (*corev1.Namespace, error) {
+	return c.Clientset.CoreV1().Namespaces().Create(ctx, namespace, opts)
 }
 
 func (c *Client) GetNamespace(ctx context.Context, namespace string, options metav1.GetOptions) (*corev1.Namespace, error) {
@@ -407,23 +407,6 @@ func (c *Client) ListServices(ctx context.Context, namespace string, options met
 	return c.Clientset.CoreV1().Services(namespace).List(ctx, options)
 }
 
-func (c *Client) WriteFileToPod(ctx context.Context, namespace, pod, container, path string, content []byte, mode int32) error {
-	result, err := c.execInPod(ctx, ExecParameters{
-		Namespace: namespace,
-		Pod:       pod,
-		Container: container,
-	})
-	if err != nil {
-		return fmt.Errorf("error executing cat in pod: %s", err)
-	}
-
-	if errString := result.Stderr.String(); errString != "" {
-		return fmt.Errorf("error writing file to pod: %s", errString)
-	}
-
-	return nil
-}
-
 func (c *Client) ExecInPodWithStderr(ctx context.Context, namespace, pod, container string, command []string) (bytes.Buffer, bytes.Buffer, error) {
 	result, err := c.execInPod(ctx, ExecParameters{
 		Namespace: namespace,
@@ -511,6 +494,10 @@ func (c *Client) ListDaemonSet(ctx context.Context, namespace string, o metav1.L
 
 func (c *Client) DeleteDaemonSet(ctx context.Context, namespace, name string, opts metav1.DeleteOptions) error {
 	return c.Clientset.AppsV1().DaemonSets(namespace).Delete(ctx, name, opts)
+}
+
+func (c *Client) GetStatefulSet(ctx context.Context, namespace, name string, opts metav1.GetOptions) (*appsv1.StatefulSet, error) {
+	return c.Clientset.AppsV1().StatefulSets(namespace).Get(ctx, name, opts)
 }
 
 func (c *Client) GetCRD(ctx context.Context, name string, opts metav1.GetOptions) (*apiextensions.CustomResourceDefinition, error) {
@@ -686,6 +673,10 @@ func (c *Client) ListCiliumEnvoyConfigs(ctx context.Context, namespace string, o
 	return c.CiliumClientset.CiliumV2().CiliumEnvoyConfigs(namespace).List(ctx, options)
 }
 
+func (c *Client) GetNode(ctx context.Context, name string, opts metav1.GetOptions) (*corev1.Node, error) {
+	return c.Clientset.CoreV1().Nodes().Get(ctx, name, opts)
+}
+
 func (c *Client) ListNodes(ctx context.Context, options metav1.ListOptions) (*corev1.NodeList, error) {
 	return c.Clientset.CoreV1().Nodes().List(ctx, options)
 }
@@ -730,8 +721,32 @@ func (c *Client) DeleteCiliumNetworkPolicy(ctx context.Context, namespace, name 
 	return c.CiliumClientset.CiliumV2().CiliumNetworkPolicies(namespace).Delete(ctx, name, opts)
 }
 
+func (c *Client) ListCiliumEgressGatewayPolicies(ctx context.Context, opts metav1.ListOptions) (*ciliumv2.CiliumEgressGatewayPolicyList, error) {
+	return c.CiliumClientset.CiliumV2().CiliumEgressGatewayPolicies().List(ctx, opts)
+}
+
+func (c *Client) GetCiliumEgressGatewayPolicy(ctx context.Context, name string, opts metav1.GetOptions) (*ciliumv2.CiliumEgressGatewayPolicy, error) {
+	return c.CiliumClientset.CiliumV2().CiliumEgressGatewayPolicies().Get(ctx, name, opts)
+}
+
+func (c *Client) CreateCiliumEgressGatewayPolicy(ctx context.Context, cegp *ciliumv2.CiliumEgressGatewayPolicy, opts metav1.CreateOptions) (*ciliumv2.CiliumEgressGatewayPolicy, error) {
+	return c.CiliumClientset.CiliumV2().CiliumEgressGatewayPolicies().Create(ctx, cegp, opts)
+}
+
+func (c *Client) UpdateCiliumEgressGatewayPolicy(ctx context.Context, cegp *ciliumv2.CiliumEgressGatewayPolicy, opts metav1.UpdateOptions) (*ciliumv2.CiliumEgressGatewayPolicy, error) {
+	return c.CiliumClientset.CiliumV2().CiliumEgressGatewayPolicies().Update(ctx, cegp, opts)
+}
+
+func (c *Client) DeleteCiliumEgressGatewayPolicy(ctx context.Context, name string, opts metav1.DeleteOptions) error {
+	return c.CiliumClientset.CiliumV2().CiliumEgressGatewayPolicies().Delete(ctx, name, opts)
+}
+
 func (c *Client) ListCiliumBGPPeeringPolicies(ctx context.Context, opts metav1.ListOptions) (*ciliumv2alpha1.CiliumBGPPeeringPolicyList, error) {
 	return c.CiliumClientset.CiliumV2alpha1().CiliumBGPPeeringPolicies().List(ctx, opts)
+}
+
+func (c *Client) ListCiliumCIDRGroups(ctx context.Context, opts metav1.ListOptions) (*ciliumv2alpha1.CiliumCIDRGroupList, error) {
+	return c.CiliumClientset.CiliumV2alpha1().CiliumCIDRGroups().List(ctx, opts)
 }
 
 func (c *Client) ListCiliumClusterwideNetworkPolicies(ctx context.Context, opts metav1.ListOptions) (*ciliumv2.CiliumClusterwideNetworkPolicyList, error) {
@@ -774,7 +789,7 @@ func (c *Client) ListNamespaces(ctx context.Context, o metav1.ListOptions) (*cor
 	return c.Clientset.CoreV1().Namespaces().List(ctx, o)
 }
 
-func (c *Client) GetPodsTable(ctx context.Context) (*metav1.Table, error) {
+func (c *Client) GetPodsTable(_ context.Context) (*metav1.Table, error) {
 	r := resource.NewBuilder(c.RESTClientGetter).
 		Unstructured().
 		AllNamespaces(true).
@@ -815,6 +830,10 @@ func (c *Client) ListEndpoints(ctx context.Context, o metav1.ListOptions) (*core
 	return c.Clientset.CoreV1().Endpoints(corev1.NamespaceAll).List(ctx, o)
 }
 
+func (c *Client) ListIngressClasses(ctx context.Context, o metav1.ListOptions) (*networkingv1.IngressClassList, error) {
+	return c.Clientset.NetworkingV1().IngressClasses().List(ctx, o)
+}
+
 func (c *Client) ListIngresses(ctx context.Context, o metav1.ListOptions) (*networkingv1.IngressList, error) {
 	return c.Clientset.NetworkingV1().Ingresses(corev1.NamespaceAll).List(ctx, o)
 }
@@ -833,6 +852,10 @@ func (c *Client) ListCiliumNodes(ctx context.Context) (*ciliumv2.CiliumNodeList,
 
 func (c *Client) ListCiliumNodeConfigs(ctx context.Context, namespace string, opts metav1.ListOptions) (*ciliumv2alpha1.CiliumNodeConfigList, error) {
 	return c.CiliumClientset.CiliumV2alpha1().CiliumNodeConfigs(namespace).List(ctx, opts)
+}
+
+func (c *Client) ListCiliumPodIPPools(ctx context.Context, opts metav1.ListOptions) (*ciliumv2alpha1.CiliumPodIPPoolList, error) {
+	return c.CiliumClientset.CiliumV2alpha1().CiliumPodIPPools().List(ctx, opts)
 }
 
 func (c *Client) GetLogs(ctx context.Context, namespace, name, container string, sinceTime time.Time, limitBytes int64, previous bool) (string, error) {
@@ -923,6 +946,16 @@ func (c *Client) GetCiliumVersion(ctx context.Context, p *corev1.Pod) (*semver.V
 }
 
 func (c *Client) GetRunningCiliumVersion(ctx context.Context, namespace string) (string, error) {
+	if utils.IsInHelmMode() {
+		release, err := helm.Get(c.RESTClientGetter, helm.GetParameters{
+			Namespace: namespace,
+			Name:      defaults.HelmReleaseName,
+		})
+		if err != nil {
+			return "", err
+		}
+		return release.Chart.Metadata.Version, nil
+	}
 	pods, err := c.ListPods(ctx, namespace, metav1.ListOptions{LabelSelector: defaults.AgentPodSelector})
 	if err != nil {
 		return "", fmt.Errorf("unable to list cilium pods: %w", err)
@@ -940,10 +973,6 @@ func (c *Client) GetRunningCiliumVersion(ctx context.Context, namespace string) 
 	return "", errors.New("unable to obtain cilium version: no cilium pods found")
 }
 
-func (c *Client) ListCiliumEgressGatewayPolicies(ctx context.Context, opts metav1.ListOptions) (*ciliumv2.CiliumEgressGatewayPolicyList, error) {
-	return c.CiliumClientset.CiliumV2().CiliumEgressGatewayPolicies().List(ctx, opts)
-}
-
 func (c *Client) ListCiliumLoadBalancerIPPools(ctx context.Context, opts metav1.ListOptions) (*ciliumv2alpha1.CiliumLoadBalancerIPPoolList, error) {
 	return c.CiliumClientset.CiliumV2alpha1().CiliumLoadBalancerIPPools().List(ctx, opts)
 }
@@ -952,7 +981,7 @@ func (c *Client) ListCiliumLocalRedirectPolicies(ctx context.Context, namespace 
 	return c.CiliumClientset.CiliumV2().CiliumLocalRedirectPolicies(namespace).List(ctx, opts)
 }
 
-func (c *Client) GetPlatform(ctx context.Context) (*Platform, error) {
+func (c *Client) GetPlatform(_ context.Context) (*Platform, error) {
 	v, err := c.Clientset.Discovery().ServerVersion()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get Kubernetes version: %w", err)
@@ -996,6 +1025,14 @@ func (c *Client) CreateIngressClass(ctx context.Context, ingressClass *networkin
 	return c.Clientset.NetworkingV1().IngressClasses().Create(ctx, ingressClass, opts)
 }
 
+func (c *Client) GetIngress(ctx context.Context, namespace string, name string, opts metav1.GetOptions) (*networkingv1.Ingress, error) {
+	return c.Clientset.NetworkingV1().Ingresses(namespace).Get(ctx, name, opts)
+}
+
+func (c *Client) CreateIngress(ctx context.Context, namespace string, ingress *networkingv1.Ingress, opts metav1.CreateOptions) (*networkingv1.Ingress, error) {
+	return c.Clientset.NetworkingV1().Ingresses(namespace).Create(ctx, ingress, opts)
+}
+
 func (c *Client) DeleteIngressClass(ctx context.Context, name string, opts metav1.DeleteOptions) error {
 	return c.Clientset.NetworkingV1().IngressClasses().Delete(ctx, name, opts)
 }
@@ -1033,7 +1070,7 @@ func (c *Client) GetHelmState(ctx context.Context, namespace string, secretName 
 	}, nil
 }
 
-func (c *Client) ListAPIResources(ctx context.Context) ([]string, error) {
+func (c *Client) ListAPIResources(_ context.Context) ([]string, error) {
 	lists, err := c.Clientset.Discovery().ServerPreferredResources()
 	if err != nil {
 		return nil, fmt.Errorf("failed to list api resources: %w", err)
@@ -1081,4 +1118,8 @@ func (c *Client) CreateEphemeralContainer(ctx context.Context, pod *corev1.Pod, 
 
 func (c *Client) ListTetragonTracingPolicies(ctx context.Context, opts metav1.ListOptions) (*tetragonv1alpha1.TracingPolicyList, error) {
 	return c.TetragonClientset.CiliumV1alpha1().TracingPolicies().List(ctx, opts)
+}
+
+func (c *Client) ListTetragonTracingPoliciesNamespaced(ctx context.Context, namespace string, opts metav1.ListOptions) (*tetragonv1alpha1.TracingPolicyNamespacedList, error) {
+	return c.TetragonClientset.CiliumV1alpha1().TracingPoliciesNamespaced(namespace).List(ctx, opts)
 }

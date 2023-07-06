@@ -19,9 +19,15 @@ const (
 	ciliumConfigMapName                = defaults.ConfigMapName
 	ciliumEtcdSecretsSecretName        = "cilium-etcd-secrets"
 	ciliumOperatorDeploymentName       = defaults.OperatorDeploymentName
+	ciliumSPIREServerStatefulSetName   = defaults.SPIREServerStatefulSetName
+	ciliumSPIREAgentDaemonSetName      = defaults.SPIREAgentDaemonSetName
+	ciliumSPIREServerConfigMapName     = defaults.SPIREServerConfigMapName
+	ciliumSPIREAgentConfigMapName      = defaults.SPIREAgentConfigMapName
 	clustermeshApiserverDeploymentName = defaults.ClusterMeshDeploymentName
 	hubbleContainerName                = "hubble"
 	hubbleDaemonSetName                = "hubble"
+	ciliumEnvoyDaemonSetName           = "cilium-envoy"
+	ciliumEnvoyConfigMapName           = defaults.EnvoyConfigMapName
 	hubbleRelayConfigMapName           = defaults.RelayConfigMapName
 	hubbleRelayContainerName           = defaults.RelayContainerName
 	hubbleRelayDeploymentName          = defaults.RelayDeploymentName
@@ -37,6 +43,12 @@ const (
 	ciliumClusterwideEnvoyConfigsFileName    = "ciliumclusterwideenvoyconfigs-<ts>.yaml"
 	ciliumConfigMapFileName                  = "cilium-configmap-<ts>.yaml"
 	ciliumDaemonSetFileName                  = "cilium-daemonset-<ts>.yaml"
+	ciliumEnvoyDaemonsetFileName             = "cilium-envoy-daemonset-<ts>.yaml"
+	ciliumEnvoyConfigMapFileName             = "cilium-envoy-configmap-<ts>.yaml"
+	ciliumSPIREAgentDaemonsetFileName        = "cilium-spire-agent-daemonset-<ts>.yaml"
+	ciliumSPIREAgentConfigMapFileName        = "cilium-spire-agent-configmap-<ts>.yaml"
+	ciliumSPIREServerStatefulSetFileName     = "cilium-spire-server-statefulset-<ts>.yaml"
+	ciliumSPIREServerConfigMapFileName       = "cilium-spire-server-configmap-<ts>.yaml"
 	ciliumIngressesFileName                  = "ciliumingresses-<ts>.yaml"
 	ciliumEgressNATPoliciesFileName          = "ciliumegressnatpolicies-<ts>.yaml"
 	ciliumEgressGatewayPoliciesFileName      = "ciliumegressgatewaypolicies-<ts>.yaml"
@@ -46,6 +58,7 @@ const (
 	ciliumEtcdSecretFileName                 = "cilium-etcd-secrets-secret-<ts>.yaml"
 	ciliumExternalWorkloadFileName           = "ciliumexternalworkload-<ts>.yaml"
 	ciliumIdentitiesFileName                 = "ciliumidentities-<ts>.yaml"
+	ciliumCIDRGroupsFileName                 = "ciliumcidrgroups-<ts>.yaml"
 	ciliumLocalRedirectPoliciesFileName      = "ciliumlocalredirectpolicies-<ts>.yaml"
 	ciliumLoadBalancerIPPoolsFileName        = "ciliumloadbalancerippools-<ts>.yaml"
 	ciliumLogsFileName                       = "logs-%s-%s-<ts>.log"
@@ -54,6 +67,7 @@ const (
 	ciliumNodesFileName                      = "ciliumnodes-<ts>.yaml"
 	ciliumNodeConfigsFileName                = "ciliumnodeconfigs-<ts>.yaml"
 	ciliumOperatorDeploymentFileName         = "cilium-operator-deployment-<ts>.yaml"
+	ciliumPodIPPoolsFileName                 = "ciliumpodippools-<ts>.yaml"
 	clustermeshApiserverDeploymentFileName   = "clustermesh-apiserver-deployment-<ts>.yaml"
 	cniConfigMapFileName                     = "cni-configmap-<ts>.yaml"
 	cniConfigFileName                        = "cniconf-%s-%s-<ts>.txt"
@@ -78,6 +92,15 @@ const (
 	kubernetesVersionInfoFileName            = "k8s-version-<ts>.txt"
 	securityGroupPoliciesFileName            = "aws-securitygrouppolicies-<ts>.yaml"
 	timestampPlaceholderFileName             = "<ts>"
+	gatewayClassesFileName                   = "gatewayapi-gatewayclasses-<ts>.yaml"
+	gatewaysFileName                         = "gatewayapi-gateways-<ts>.yaml"
+	httpRoutesFileName                       = "gatewayapi-httproutes-<ts>.yaml"
+	tlsRoutesFileName                        = "gatewayapi-tlsroutes-<ts>.yaml"
+	grpcRoutesFileName                       = "gatewayapi-grpcroutes-<ts>.yaml"
+	tcpRoutesFileName                        = "gatewayapi-tcroutes-<ts>.yaml"
+	udpRoutesFileName                        = "gatewayapi-udproutes-<ts>.yaml"
+	referenceGrantsFileName                  = "gatewayapi-referencegrants-<ts>.yaml"
+	ingressClassesFileName                   = "ingressclasses-<ts>.yaml"
 )
 
 const (
@@ -119,11 +142,53 @@ var (
 		"pprof-heap",
 		"pprof-cpu",
 	}
-)
 
-var (
-	tetragonAgentContainerName = "tetragon"
-	tetragonBugtoolPrefix      = "tetragon-bugtool"
-	tetragonCliCommand         = "tetra"
-	tetragonTracingPolicy      = "tetragontracingpolicy-<ts>.yaml"
+	// Gateway API resource group versions used for sysdumping these
+	gatewayClass = schema.GroupVersionResource{
+		Group:    "gateway.networking.k8s.io",
+		Resource: "gatewayclasses",
+		Version:  "v1beta1",
+	}
+
+	gateway = schema.GroupVersionResource{
+		Group:    "gateway.networking.k8s.io",
+		Resource: "gateways",
+		Version:  "v1beta1",
+	}
+
+	referenceGrant = schema.GroupVersionResource{
+		Group:    "gateway.networking.k8s.io",
+		Resource: "referencegrants",
+		Version:  "v1alpha2",
+	}
+
+	httpRoute = schema.GroupVersionResource{
+		Group:    "gateway.networking.k8s.io",
+		Resource: "httproutes",
+		Version:  "v1beta1",
+	}
+
+	tlsRoute = schema.GroupVersionResource{
+		Group:    "gateway.networking.k8s.io",
+		Resource: "tlsroutes",
+		Version:  "v1alpha2",
+	}
+
+	tcpRoute = schema.GroupVersionResource{
+		Group:    "gateway.networking.k8s.io",
+		Resource: "tcproutes",
+		Version:  "v1alpha2",
+	}
+
+	udpRoute = schema.GroupVersionResource{
+		Group:    "gateway.networking.k8s.io",
+		Resource: "udproutes",
+		Version:  "v1alpha2",
+	}
+
+	grpcRoute = schema.GroupVersionResource{
+		Group:    "gateway.networking.k8s.io",
+		Resource: "grpcroutes",
+		Version:  "v1alpha2",
+	}
 )

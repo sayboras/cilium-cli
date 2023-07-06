@@ -9,6 +9,7 @@ import (
 
 	"github.com/cilium/cilium-cli/defaults"
 	"github.com/cilium/cilium-cli/hubble"
+	"github.com/cilium/cilium-cli/internal/utils"
 
 	"github.com/spf13/cobra"
 )
@@ -24,7 +25,7 @@ func newCmdHubble() *cobra.Command {
 		newCmdPortForwardCommand(),
 		newCmdUI(),
 	)
-	if os.Getenv("CILIUM_CLI_MODE") == "helm" {
+	if utils.IsInHelmMode() {
 		cmd.AddCommand(
 			newCmdHubbleEnableWithHelm(),
 			newCmdHubbleDisableWithHelm(),
@@ -174,7 +175,7 @@ func newCmdUI() *cobra.Command {
 			params.Context = contextName
 			params.Namespace = namespace
 
-			if err := params.UIPortForwardCommand(context.Background()); err != nil {
+			if err := params.UIPortForwardCommand(); err != nil {
 				fatalf("Unable to port forward: %s", err)
 			}
 			return nil

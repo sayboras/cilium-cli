@@ -6,17 +6,6 @@ package sysdump
 import (
 	"runtime"
 	"time"
-
-	// for envoy unmarshalling
-	_ "github.com/cilium/proxy/go/envoy/config/cluster/v3"
-	_ "github.com/cilium/proxy/go/envoy/config/core/v3"
-	_ "github.com/cilium/proxy/go/envoy/config/endpoint/v3"
-	_ "github.com/cilium/proxy/go/envoy/config/listener/v3"
-	_ "github.com/cilium/proxy/go/envoy/config/route/v3"
-	_ "github.com/cilium/proxy/go/envoy/extensions/filters/network/http_connection_manager/v3"
-	_ "github.com/cilium/proxy/go/envoy/extensions/transport_sockets/tls/v3"
-	_ "github.com/cilium/proxy/go/envoy/extensions/upstreams/http/v3"
-	_ "github.com/cilium/proxy/go/envoy/type/matcher/v3"
 )
 
 const (
@@ -25,6 +14,7 @@ const (
 
 const (
 	DefaultCiliumLabelSelector               = labelPrefix + "cilium"
+	DefaultCiliumEnvoyLabelSelector          = labelPrefix + "cilium-envoy"
 	DefaultCiliumOperatorLabelSelector       = "io.cilium/app=operator"
 	DefaultClustermeshApiserverLabelSelector = labelPrefix + "clustermesh-apiserver"
 	DefaultDebug                             = false
@@ -46,6 +36,11 @@ const (
 	DefaultCNIConfigMapName                  = "cni-configuration"
 	DefaultTetragonNamespace                 = "kube-system"
 	DefaultTetragonLabelSelector             = "app.kubernetes.io/name=tetragon"
+	DefaultTetragonAgentContainerName        = "tetragon"
+	DefaultTetragonBugtoolPrefix             = "tetragon-bugtool"
+	DefaultTetragonCLICommand                = "tetra"
+	DefaultTetragonTracingPolicy             = "tetragontracingpolicy-<ts>.yaml"
+	DefaultTetragonTracingPolicyNamespaced   = "tetragontracingpolicynamespaced-<ts>.yaml"
 )
 
 var (
@@ -58,4 +53,8 @@ var (
 	// DefaultCiliumNamespaces will be used to attempt to autodetect what namespace Cilium is installed in
 	// unless otherwise specified.
 	DefaultCiliumNamespaces = []string{"kube-system", "cilium"}
+
+	// DefaultCiliumSPIRENamespaces will be used to attempt to autodetect what namespace Cilium SPIRE is installed in
+	// unless otherwise specified.
+	DefaultCiliumSPIRENamespaces = []string{"kube-system", "cilium", "cilium-spire"}
 )

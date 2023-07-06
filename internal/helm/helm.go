@@ -31,14 +31,13 @@ import (
 	"helm.sh/helm/v3/pkg/cli"
 	"helm.sh/helm/v3/pkg/cli/values"
 	"helm.sh/helm/v3/pkg/getter"
+	"helm.sh/helm/v3/pkg/registry"
 	"helm.sh/helm/v3/pkg/release"
 	"helm.sh/helm/v3/pkg/releaseutil"
 	"helm.sh/helm/v3/pkg/strvals"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
 )
-
-const ciliumChart = "https://helm.cilium.io"
 
 var settings = cli.New()
 
@@ -97,6 +96,7 @@ func filterManifests(manifest string) map[string]string {
 	return manifestsToRender
 }
 
+// Merge maps recursively merges the values of b into a copy of a, preferring the values from b
 func mergeMaps(a, b map[string]interface{}) map[string]interface{} {
 	out := make(map[string]interface{}, len(a))
 	for k, v := range a {
@@ -217,7 +217,7 @@ func newChartFromDirectory(directory string) (*chart.Chart, error) {
 
 // newChartFromRemoteWithCache fetches the chart from remote repository, the chart file
 // is then stored in the local cache directory for future usage.
-func newChartFromRemoteWithCache(ciliumVersion semver2.Version) (*chart.Chart, error) {
+func newChartFromRemoteWithCache(ciliumVersion semver2.Version, repository string) (*chart.Chart, error) {
 	cacheDir, err := ciliumCacheDir()
 	if err != nil {
 		return nil, err
@@ -230,13 +230,26 @@ func newChartFromRemoteWithCache(ciliumVersion semver2.Version) (*chart.Chart, e
 		}
 
 		// Download the chart from remote repository
-		pull := action.NewPullWithOpts(action.WithConfig(new(action.Configuration)))
+		actionConfig := new(action.Configuration)
+		pull := action.NewPullWithOpts(action.WithConfig(actionConfig))
 		pull.Settings = settings
-		pull.RepoURL = ciliumChart
 		pull.Version = ciliumVersion.String()
 		pull.DestDir = cacheDir
-
-		if _, err = pull.Run("cilium"); err != nil {
+		chartRef := "cilium"
+		if registry.IsOCI(repository) {
+			// For OCI repositories, Pull action expects the full repository name as the
+			// chartRef argument, and RepoURL must be kept unspecified.
+			chartRef = repository
+			// OCI repos need RegistryClient for some reason. Set it here.
+			registryClient, err := registry.NewClient()
+			if err != nil {
+				return nil, err
+			}
+			actionConfig.RegistryClient = registryClient
+		} else {
+			pull.RepoURL = repository
+		}
+		if _, err = pull.Run(chartRef); err != nil {
 			return nil, err
 		}
 	}
@@ -289,7 +302,8 @@ func GenManifests(
 			if !errors.Is(err, fs.ErrNotExist) {
 				return nil, err
 			}
-			helmChart, err = newChartFromRemoteWithCache(ciliumVer)
+			// Helm repository is not configurable in the classic mode. Always use the default Helm repository.
+			helmChart, err = newChartFromRemoteWithCache(ciliumVer, defaults.HelmRepository)
 			if err != nil {
 				return nil, err
 			}
@@ -361,6 +375,20 @@ func MergeVals(
 	return vals, nil
 }
 
+// ParseVals takes a slice of Helm values of the form
+// ["some.chart.value=val1", "some.other.value=val2"]
+// and returns a deeply nested map of Values of the form
+// expected by Helm actions.
+func ParseVals(helmStrValues []string) (map[string]interface{}, error) {
+	helmValStr := strings.Join(helmStrValues, ",")
+	helmValues := map[string]interface{}{}
+	err := strvals.ParseInto(helmValStr, helmValues)
+	if err != nil {
+		return nil, fmt.Errorf("error parsing helm options %q: %w", helmValStr, err)
+	}
+	return helmValues, nil
+}
+
 // PrintHelmTemplateCommand will log a message so that users can replicate
 // the same behavior as the CLI. The log message will be slightly different
 // depending on if 'helmChartDirectory' is set or not.
@@ -406,11 +434,15 @@ func ListVersions() ([]string, error) {
 	return versions, nil
 }
 
-// ResolveHelmChartVersion resolves Helm chart version based on --version and --chart-directory flags.
-func ResolveHelmChartVersion(versionFlag, chartDirectoryFlag string) (semver2.Version, *chart.Chart, error) {
+// ResolveHelmChartVersion resolves Helm chart version based on --version, --chart-directory, and --repository flags.
+func ResolveHelmChartVersion(versionFlag, chartDirectoryFlag, repository string) (semver2.Version, *chart.Chart, error) {
+	// If repository is empty, set it to the default Helm repository ("https://helm.cilium.io") for backward compatibility.
+	if repository == "" {
+		repository = defaults.HelmRepository
+	}
 	if chartDirectoryFlag == "" {
 		// If --chart-directory flag is not specified, use the version specified with --version flag.
-		return resolveChartVersion(versionFlag)
+		return resolveChartVersion(versionFlag, repository)
 	}
 
 	// Get the chart version from the local Helm chart specified with --chart-directory flag.
@@ -421,26 +453,48 @@ func ResolveHelmChartVersion(versionFlag, chartDirectoryFlag string) (semver2.Ve
 	return versioncheck.MustVersion(localChart.Metadata.Version), localChart, nil
 }
 
-func resolveChartVersion(versionFlag string) (semver2.Version, *chart.Chart, error) {
+func resolveChartVersion(versionFlag string, repository string) (semver2.Version, *chart.Chart, error) {
 	version, err := utils.ParseCiliumVersion(versionFlag)
 	if err != nil {
 		return semver2.Version{}, nil, err
 	}
 
-	helmChart, err := newChartFromEmbeddedFile(version)
-	if err == nil {
-		return version, helmChart, nil
+	// If the repository is the default repository ("https://helm.cilium.io"), check embedded charts first.
+	if repository == defaults.HelmRepository {
+		helmChart, err := newChartFromEmbeddedFile(version)
+		if err == nil {
+			return version, helmChart, nil
+		}
+
+		if !errors.Is(err, fs.ErrNotExist) {
+			return semver2.Version{}, nil, err
+		}
 	}
 
-	if !errors.Is(err, fs.ErrNotExist) {
-		return semver2.Version{}, nil, err
-	}
-
-	helmChart, err = newChartFromRemoteWithCache(version)
+	helmChart, err := newChartFromRemoteWithCache(version, repository)
 	if err != nil {
 		return semver2.Version{}, nil, err
 	}
 	return version, helmChart, nil
+}
+
+// GetCurrentRelease gets the currently deployed release
+func GetCurrentRelease(
+	k8sClient genericclioptions.RESTClientGetter,
+	namespace, name string,
+) (*release.Release, error) {
+	// Use the default Helm driver (Kubernetes secret).
+	helmDriver := ""
+	actionConfig := action.Configuration{}
+	logger := func(format string, v ...interface{}) {}
+	if err := actionConfig.Init(k8sClient, namespace, helmDriver, logger); err != nil {
+		return nil, err
+	}
+	currentRelease, err := actionConfig.Releases.Last(name)
+	if err != nil {
+		return nil, err
+	}
+	return currentRelease, nil
 }
 
 // UpgradeParameters contains parameters for helm upgrade operation.
@@ -478,7 +532,7 @@ func Upgrade(
 	actionConfig := action.Configuration{}
 	// Use the default Helm driver (Kubernetes secret).
 	helmDriver := ""
-	// TODO(michi) Make the logger configurable
+	// TODO(michi) Make the logger configurable (search for all instances)
 	logger := func(format string, v ...interface{}) {}
 	if err := actionConfig.Init(k8sClient, params.Namespace, helmDriver, logger); err != nil {
 		return nil, err
@@ -501,4 +555,28 @@ func Upgrade(
 	helmClient.DryRun = params.DryRun || params.DryRunHelmValues
 
 	return helmClient.RunWithContext(ctx, defaults.HelmReleaseName, params.Chart, params.Values)
+}
+
+// GetParameters contains parameters for helm get operation.
+type GetParameters struct {
+	// Namespace in which the Helm release is installed.
+	Namespace string
+	// Name of the Helm release to get.
+	Name string
+}
+
+// Get returns the Helm release specified by GetParameters.
+func Get(
+	k8sClient genericclioptions.RESTClientGetter,
+	params GetParameters,
+) (*release.Release, error) {
+	actionConfig := action.Configuration{}
+	// Use the default Helm driver (Kubernetes secret).
+	helmDriver := ""
+	logger := func(format string, v ...interface{}) {}
+	if err := actionConfig.Init(k8sClient, params.Namespace, helmDriver, logger); err != nil {
+		return nil, err
+	}
+	helmClient := action.NewGet(&actionConfig)
+	return helmClient.Run(params.Name)
 }

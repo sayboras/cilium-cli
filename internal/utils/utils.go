@@ -6,12 +6,12 @@ package utils
 import (
 	"context"
 	"fmt"
+	"os"
 	"regexp"
 	"strings"
 	"time"
 
 	"github.com/blang/semver/v4"
-	"github.com/cilium/cilium/pkg/versioncheck"
 
 	"github.com/cilium/cilium-cli/defaults"
 )
@@ -26,8 +26,7 @@ func CheckVersion(version string) error {
 }
 
 func ParseCiliumVersion(version string) (semver.Version, error) {
-	ersion := strings.TrimPrefix(version, "v")
-	return versioncheck.Version(ersion)
+	return semver.ParseTolerant(version)
 }
 
 type ImagePathMode int
@@ -35,6 +34,7 @@ type ImagePathMode int
 const (
 	ImagePathExcludeDigest ImagePathMode = iota
 	ImagePathIncludeDigest
+	CLIModeVariableName = "CILIUM_CLI_MODE"
 )
 
 var imageRegexp = regexp.MustCompile(`\A(.*?)(?:(:.*?)(@sha256:[0-9a-f]{64})?)?\z`)
@@ -173,4 +173,9 @@ func Contains(l []string, v string) bool {
 		}
 	}
 	return false
+}
+
+// IsInHelmMode returns true if cilium-cli is in "helm" mode. Otherwise, it returns false.
+func IsInHelmMode() bool {
+	return os.Getenv(CLIModeVariableName) != "classic"
 }

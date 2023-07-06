@@ -3,7 +3,7 @@ name: External Workloads
 # Any change in triggers needs to be reflected in the concurrency group.
 on:
   ### FOR TESTING PURPOSES
-  # This workflow runs in the context of `master`, and ignores changes to
+  # This workflow runs in the context of `main`, and ignores changes to
   # workflow files in PRs. For testing changes to this workflow from a PR:
   # - Make sure the PR uses a branch from the base repository (requires write
   #   privileges). It will not work with a branch from a fork (missing secrets).
@@ -13,7 +13,7 @@ on:
   # - Don't forget to remove the `DO NOT MERGE` commit once satisfied. The run
   #   will disappear from the PR checks: please provide a direct link to the
   #   successful workflow run (can be found from Actions tab) in a comment.
-  # 
+  #
   # pull_request: {}
   ###
   pull_request_target: {}
@@ -26,11 +26,10 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  clusterName: ${{ github.repository_owner }}-${{ github.event.repository.name }}-${{ github.run_id }}-vm
-  vmName: ${{ github.repository_owner }}-${{ github.event.repository.name }}-${{ github.run_id }}-vm
   zone: us-west2-a
   vmStartupScript: .github/gcp-vm-startup.sh
-  cilium_version: v1.13.2
+  # renovate: datasource=github-releases depName=cilium/cilium
+  cilium_version: v1.13.4
   kubectl_version: v1.23.6
   USE_GKE_GCLOUD_AUTH_PLUGIN: True
 
@@ -39,9 +38,17 @@ jobs:
     if: ${{ github.repository == 'cilium/cilium-cli' }}
     runs-on: ubuntu-22.04
     timeout-minutes: 45
+    strategy:
+      matrix:
+        mode: ["classic", "helm"]
     steps:
+      - name: Set cluster name
+        run: |
+          echo "clusterName=${{ github.repository_owner }}-${{ github.event.repository.name }}-${{ github.run_id }}-${{ matrix.mode }}-vm${{ github.run_attempt }}" >> $GITHUB_ENV
+          echo "vmName=${{ github.repository_owner }}-${{ github.event.repository.name }}-${{ github.run_id }}-${{ matrix.mode }}-vm${{ github.run_attempt }}" >> $GITHUB_ENV
+
       - name: Checkout
-        uses: actions/checkout@8e5e7e5ab8b370d6c329ec480221332ada57f0ab
+        uses: actions/checkout@c85c95e3d7251135ab7dc9ce3241c5835cc595a9 # v3.5.3
 
       - name: Install kubectl
         run: |
@@ -53,12 +60,12 @@ jobs:
 
       - name: Set up gcloud credentials
         id: 'auth'
-        uses: 'google-github-actions/auth@e8df18b60c5dd38ba618c121b779307266153fbf'
+        uses: google-github-actions/auth@35b0e87d162680511bf346c299f71c9c5c379033 # v1.1.1
         with:
           credentials_json: '${{ secrets.GCP_PR_SA_KEY }}'
 
       - name: Set up gcloud CLI
-        uses: google-github-actions/setup-gcloud@62d4898025f6041e16b1068643bfc5a696863587
+        uses: google-github-actions/setup-gcloud@e30db14379863a8c79331b04a9969f4c1e225e0b # v1.1.1
         with:
           project_id: ${{ secrets.GCP_PR_PROJECT_ID }}
           version: "405.0.0"
@@ -90,7 +97,7 @@ jobs:
           echo "owner=${OWNER}" >> $GITHUB_OUTPUT
 
       - name: Create GCP VM
-        uses: nick-invision/retry@943e742917ac94714d2f408a0e8320f2d1fcafcd
+        uses: nick-invision/retry@943e742917ac94714d2f408a0e8320f2d1fcafcd # v2.8.3
         with:
           retry_on: error
           timeout_minutes: 1
@@ -114,6 +121,9 @@ jobs:
           gcloud container clusters create ${{ env.clusterName }} \
             --labels "usage=${{ github.repository_owner }}-${{ github.event.repository.name }},owner=${{ steps.vars.outputs.owner }}" \
             --zone ${{ env.zone }} \
+            --enable-ip-alias \
+            --cluster-ipv4-cidr="/21" \
+            --services-ipv4-cidr="/24" \
             --image-type COS_CONTAINERD \
             --num-nodes 2 \
             --machine-type e2-custom-2-4096 \
@@ -147,7 +157,8 @@ jobs:
             --set job_name=cilium-cli-install \
             --set test_script_cm=cilium-cli-test-script-install \
             --set vm_name=${{ env.vmName }} \
-            --set cluster_cidr=${{ steps.cluster.outputs.cluster_cidr }}
+            --set cluster_cidr=${{ steps.cluster.outputs.cluster_cidr }} \
+            --set cilium_cli_mode=${{ matrix.mode }}
 
       - name: Wait for install job
         env:
@@ -204,7 +215,8 @@ jobs:
             --generate-name \
             --set tag=${{ steps.vars.outputs.sha }} \
             --set job_name=cilium-cli \
-            --set test_script_cm=cilium-cli-test-script
+            --set test_script_cm=cilium-cli-test-script \
+            --set cilium_cli_mode=${{ matrix.mode }}
 
       - name: Wait for test job
         env:
@@ -263,7 +275,7 @@ jobs:
 
       - name: Upload artifacts
         if: ${{ !success() }}
-        uses: actions/upload-artifact@0b7f8abb1508181956e8e162db84b466c27e18ce
+        uses: actions/upload-artifact@0b7f8abb1508181956e8e162db84b466c27e18ce # v3.1.2
         with:
           name: cilium-sysdump-out.zip
           path: cilium-sysdump-out.zip

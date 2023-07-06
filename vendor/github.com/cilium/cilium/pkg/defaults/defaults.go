@@ -26,6 +26,9 @@ const (
 	// GopsPortApiserver is the default value for option.GopsPort in the apiserver
 	GopsPortApiserver = 9892
 
+	// GopsPortKVStoreMesh is the default value for option.GopsPort in kvstoremesh
+	GopsPortKVStoreMesh = 9894
+
 	// IPv6ClusterAllocCIDR is the default value for option.IPv6ClusterAllocCIDR
 	IPv6ClusterAllocCIDR = IPv6ClusterAllocCIDRBase + "/64"
 
@@ -204,9 +207,6 @@ const (
 	// EnableHostLegacyRouting is the default value for using the old routing path via stack.
 	EnableHostLegacyRouting = false
 
-	// EnableExternalIPs is the default value for k8s service with externalIPs feature.
-	EnableExternalIPs = true
-
 	// K8sEnableEndpointSlice is the default value for k8s EndpointSlice feature.
 	K8sEnableEndpointSlice = true
 
@@ -215,6 +215,14 @@ const (
 
 	// EnableIPSec is the default value for IPSec enablement
 	EnableIPSec = false
+
+	// IPsecKeyRotationDuration is the time to wait before removing old keys when
+	// the IPsec key is changing.
+	IPsecKeyRotationDuration = 5 * time.Minute
+
+	// Enable watcher for IPsec key. If disabled, a restart of the agent will
+	// be necessary on key rotations.
+	EnableIPsecKeyWatcher = true
 
 	// EncryptNode enables encrypting traffic from host networking applications
 	// which are not part of Cilium manged pods.
@@ -322,11 +330,6 @@ const (
 	// LoopbackIPv4 is the default address for service loopback
 	LoopbackIPv4 = "169.254.42.1"
 
-	// ForceLocalPolicyEvalAtSource is the default value for
-	// option.ForceLocalPolicyEvalAtSource. It can be enabled to provide
-	// backwards compatibility.
-	ForceLocalPolicyEvalAtSource = false
-
 	// EnableEndpointRoutes is the value for option.EnableEndpointRoutes.
 	// It is disabled by default for backwards compatibility.
 	EnableEndpointRoutes = false
@@ -366,6 +369,10 @@ const (
 	// IPAMPreAllocation is the default value for
 	// CiliumNode.Spec.IPAM.PreAllocate if no value is set
 	IPAMPreAllocation = 8
+
+	// IPAMMultiPoolPreAllocation is the default value for multi-pool IPAM
+	// pre-allocations
+	IPAMMultiPoolPreAllocation = "default=8"
 
 	// ENIFirstInterfaceIndex is the default value for
 	// CiliumNode.Spec.ENI.FirstInterfaceIndex if no value is set.
@@ -457,7 +464,7 @@ const (
 	CertsDirectory = RuntimePath + "/certs"
 
 	// EnableRemoteNodeIdentity is the default value for option.EnableRemoteNodeIdentity
-	EnableRemoteNodeIdentity = false
+	EnableRemoteNodeIdentity = true
 
 	// IPAMExpiration is the timeout after which an IP subject to expiratio
 	// is being released again if no endpoint is being created in time.
@@ -478,6 +485,11 @@ const (
 	// EnableIdentityMark enables setting identity in mark field of packet
 	// for local traffic
 	EnableIdentityMark = true
+
+	// EnableHighScaleIPcache enables the special ipcache mode for high scale
+	// clusters. The ipcache content will be reduced to the strict minimum and
+	// traffic will be encapsulated to carry security identities.
+	EnableHighScaleIPcache = false
 
 	// K8sEnableLeasesFallbackDiscovery enables k8s to fallback to API probing to check
 	// for the support of Leases in Kubernetes when there is an error in discovering
@@ -502,6 +514,15 @@ const (
 
 	// EnableICMPRules enables ICMP-based rule support for Cilium Network Policies.
 	EnableICMPRules = true
+
+	// RoutingMode enables choosing between native routing mode or tunneling mode.
+	RoutingMode = "tunnel"
+
+	// TunnelProtocol is the default tunneling protocol
+	TunnelProtocol = "vxlan"
+
+	// Use the CiliumInternalIPs (vs. NodeInternalIPs) for IPsec encapsulation.
+	UseCiliumInternalIPForIPsec = false
 
 	// TunnelPortVXLAN is the default VXLAN port
 	TunnelPortVXLAN = 8472

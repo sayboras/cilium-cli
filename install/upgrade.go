@@ -28,7 +28,7 @@ func (k *K8sInstaller) Upgrade(ctx context.Context) error {
 
 	// no need to determine KPR setting on upgrade, keep the setting configured with the old
 	// version.
-	if err := k.detectDatapathMode(ctx, false); err != nil {
+	if err := k.detectDatapathMode(false); err != nil {
 		return err
 	}
 
@@ -190,6 +190,9 @@ func (k *K8sInstaller) UpgradeWithHelm(ctx context.Context, k8sClient genericcli
 		DryRunHelmValues: k.params.DryRunHelmValues,
 	}
 	release, err := helm.Upgrade(ctx, k8sClient, upgradeParams)
+	if err != nil {
+		return err
+	}
 
 	if k.params.DryRun {
 		fmt.Println(release.Manifest)

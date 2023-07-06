@@ -23,7 +23,7 @@ var (
 	}
 )
 
-func newCmdSysdump() *cobra.Command {
+func newCmdSysdump(hooks SysdumpHooks) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "sysdump",
 		Short: "Collects information required to troubleshoot issues with Cilium and Hubble",
@@ -36,23 +36,26 @@ func newCmdSysdump() *cobra.Command {
 			// Silence klog to avoid displaying "throttling" messages - those are expected.
 			klog.SetOutput(io.Discard)
 			// Collect the sysdump.
-			collector, err := sysdump.NewCollector(k8sClient, sysdumpOptions, time.Now(), Version)
+			collector, err := sysdump.NewCollector(k8sClient, sysdumpOptions, time.Now(), version)
 			if err != nil {
-				return fmt.Errorf("failed to create sysdump collector: %v", err)
+				return fmt.Errorf("failed to create sysdump collector: %w", err)
+			}
+			if err := hooks.AddSysdumpTasks(collector); err != nil {
+				return fmt.Errorf("failed to add custom tasks: %w", err)
 			}
 			if err = collector.Run(); err != nil {
-				return fmt.Errorf("failed to collect sysdump: %v", err)
+				return fmt.Errorf("failed to collect sysdump: %w", err)
 			}
 			return nil
 		},
 	}
 
-	initSysdumpFlags(cmd, &sysdumpOptions, "")
+	initSysdumpFlags(cmd, &sysdumpOptions, "", hooks)
 
 	return cmd
 }
 
-func initSysdumpFlags(cmd *cobra.Command, options *sysdump.Options, optionPrefix string) {
+func initSysdumpFlags(cmd *cobra.Command, options *sysdump.Options, optionPrefix string, hooks SysdumpHooks) {
 	cmd.Flags().StringVar(&options.CiliumLabelSelector,
 		optionPrefix+"cilium-label-selector", sysdump.DefaultCiliumLabelSelector,
 		"The labels used to target Cilium pods")
@@ -62,9 +65,15 @@ func initSysdumpFlags(cmd *cobra.Command, options *sysdump.Options, optionPrefix
 	cmd.Flags().StringVar(&options.CiliumOperatorNamespace,
 		optionPrefix+"cilium-operator-namespace", "",
 		"The namespace Cilium operator is running in")
+	cmd.Flags().StringVar(&options.CiliumSPIRENamespace,
+		optionPrefix+"cilium-spire-namespace", "",
+		"The namespace Cilium SPIRE installation is running in")
 	cmd.Flags().StringVar(&options.CiliumDaemonSetSelector,
 		optionPrefix+"cilium-daemon-set-label-selector", sysdump.DefaultCiliumLabelSelector,
 		"The labels used to target Cilium daemon set")
+	cmd.Flags().StringVar(&options.CiliumEnvoyLabelSelector,
+		optionPrefix+"cilium-envoy-label-selector", sysdump.DefaultCiliumEnvoyLabelSelector,
+		"The labels used to target Cilium Envoy pods")
 	cmd.Flags().StringVar(&options.CiliumOperatorLabelSelector,
 		optionPrefix+"cilium-operator-label-selector", sysdump.DefaultCiliumOperatorLabelSelector,
 		"The labels used to target Cilium operator pods")
@@ -134,4 +143,6 @@ func initSysdumpFlags(cmd *cobra.Command, options *sysdump.Options, optionPrefix
 	cmd.Flags().IntVar(&options.CopyRetryLimit,
 		optionPrefix+"copy-retry-limit", sysdump.DefaultCopyRetryLimit,
 		"Retry limit for file copying operations. If set to -1, copying will be retried indefinitely. Useful for collecting sysdump while on unreliable connection.")
+
+	hooks.AddSysdumpFlags(cmd.Flags())
 }

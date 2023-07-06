@@ -3,7 +3,7 @@ name: AKS (BYOCNI)
 # Any change in triggers needs to be reflected in the concurrency group.
 on:
   ### FOR TESTING PURPOSES
-  # This workflow runs in the context of `master`, and ignores changes to
+  # This workflow runs in the context of `main`, and ignores changes to
   # workflow files in PRs. For testing changes to this workflow from a PR:
   # - Make sure the PR uses a branch from the base repository (requires write
   #   privileges). It will not work with a branch from a fork (missing secrets).
@@ -13,7 +13,7 @@ on:
   # - Don't forget to remove the `DO NOT MERGE` commit once satisfied. The run
   #   will disappear from the PR checks: please provide a direct link to the
   #   successful workflow run (can be found from Actions tab) in a comment.
-  # 
+  #
   # pull_request: {}
   ###
   pull_request_target: {}
@@ -36,20 +36,23 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  name: ${{ github.repository_owner }}-${{ github.event.repository.name }}-${{ github.run_id }}
   location: westeurope
   cost_reduction: --node-vm-size Standard_B2s --node-osdisk-size 30
-  cilium_version: v1.13.2
+  # renovate: datasource=github-releases depName=cilium/cilium
+  cilium_version: v1.13.4
   kubectl_version: v1.23.6
 
 jobs:
   installation-and-connectivity:
     if: ${{ github.repository == 'cilium/cilium-cli' }}
     runs-on: ubuntu-22.04
-    timeout-minutes: 30
+    timeout-minutes: 45
+    strategy:
+      matrix:
+        mode: ["classic", "helm"]
     steps:
       - name: Checkout
-        uses: actions/checkout@8e5e7e5ab8b370d6c329ec480221332ada57f0ab
+        uses: actions/checkout@c85c95e3d7251135ab7dc9ce3241c5835cc595a9 # v3.5.3
 
       - name: Install kubectl
         run: |
@@ -60,7 +63,7 @@ jobs:
           kubectl version --client
 
       - name: Login to Azure
-        uses: azure/login@92a5484dfaf04ca78a94597f4f19fea633851fa2
+        uses: azure/login@92a5484dfaf04ca78a94597f4f19fea633851fa2 # v1.4.7
         with:
           client-id: ${{ secrets.AZURE_PR_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_PR_TENANT_ID }}
@@ -89,19 +92,20 @@ jobs:
 
           echo "sha=${SHA}" >> $GITHUB_OUTPUT
           echo "owner=${OWNER}" >> $GITHUB_OUTPUT
+          echo "name=${{ github.event.repository.name }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.mode }}" >> $GITHUB_OUTPUT
 
       - name: Create AKS cluster
         run: |
           # Create group
           az group create \
-            --name ${{ env.name }} \
+            --name ${{ steps.vars.outputs.name }} \
             --location ${{ env.location }} \
             --tags usage=${{ github.repository_owner }}-${{ github.event.repository.name }} owner=${{ steps.vars.outputs.owner }}
 
           # Create AKS cluster
           az aks create \
-            --resource-group ${{ env.name }} \
-            --name ${{ env.name }} \
+            --resource-group ${{ steps.vars.outputs.name }} \
+            --name ${{ steps.vars.outputs.name }} \
             --location ${{ env.location }} \
             --network-plugin none \
             --node-count 2 \
@@ -111,8 +115,8 @@ jobs:
       - name: Get cluster credentials
         run: |
           az aks get-credentials \
-            --resource-group ${{ env.name }} \
-            --name ${{ env.name }}
+            --resource-group ${{ steps.vars.outputs.name }} \
+            --name ${{ steps.vars.outputs.name }}
 
       - name: Create kubeconfig and load it in configmap
         run: |
@@ -130,7 +134,8 @@ jobs:
             --set job_name=cilium-cli-install \
             --set test_script_cm=cilium-cli-test-script-install \
             --set tag=${{ steps.vars.outputs.sha }} \
-            --set cilium_version=${{ env.cilium_version }}
+            --set cilium_version=${{ env.cilium_version }} \
+            --set cilium_cli_mode=${{ matrix.mode }}
 
       - name: Wait for install job
         env:
@@ -163,11 +168,12 @@ jobs:
             --generate-name \
             --set job_name=cilium-cli \
             --set test_script_cm=cilium-cli-test-script \
-            --set tag=${{ steps.vars.outputs.sha }}
+            --set tag=${{ steps.vars.outputs.sha }} \
+            --set cilium_cli_mode=${{ matrix.mode }}
 
       - name: Wait for test job
         env:
-          timeout: 15m
+          timeout: 30m
         run: |
           # Background wait for job to complete or timeout
           kubectl -n kube-system wait job/cilium-cli --for=condition=complete --timeout=${{ env.timeout }} &
@@ -205,12 +211,12 @@ jobs:
       - name: Clean up AKS
         if: ${{ always() }}
         run: |
-          az group delete --name ${{ env.name }} --yes --no-wait
+          az group delete --name ${{ steps.vars.outputs.name }} --yes --no-wait
         shell: bash {0} # Disable default fail-fast behaviour so that all commands run independently
 
       - name: Upload artifacts
         if: ${{ !success() }}
-        uses: actions/upload-artifact@0b7f8abb1508181956e8e162db84b466c27e18ce
+        uses: actions/upload-artifact@0b7f8abb1508181956e8e162db84b466c27e18ce # v3.1.2
         with:
           name: cilium-sysdump-out.zip
           path: cilium-sysdump-out.zip

@@ -8,8 +8,10 @@ import (
 	"net/url"
 	"strconv"
 
+	"github.com/cilium/cilium/api/v1/flow"
 	ciliumv2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	corev1 "k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 
 	"github.com/cilium/cilium-cli/k8s"
 )
@@ -40,6 +42,8 @@ type TestPeer interface {
 
 	// Labels returns copy of peer labels
 	Labels() map[string]string
+
+	FlowFilters() []*flow.FlowFilter
 }
 
 // Pod is a Kubernetes Pod acting as a peer in a connectivity test.
@@ -60,6 +64,9 @@ type Pod struct {
 
 	// Port the Pods is listening on for connectivity tests.
 	port uint32
+
+	// The pod is running on a node which doesn't run Cilium
+	Outside bool
 }
 
 func (p Pod) String() string {
@@ -69,6 +76,21 @@ func (p Pod) String() string {
 // Name returns the absolute name of the Pod.
 func (p Pod) Name() string {
 	return p.Pod.Namespace + "/" + p.Pod.Name
+}
+
+// NameWithoutNamespace returns only the name of the Pod.
+func (p Pod) NameWithoutNamespace() string {
+	return p.Pod.Name
+}
+
+// NodeName returns the node name a pod belongs to.
+func (p Pod) NodeName() string {
+	return p.Pod.Spec.NodeName
+}
+
+// Namespace returns the namespace the pod belongs to.
+func (p Pod) Namespace() string {
+	return p.Pod.Namespace
 }
 
 func (p Pod) Scheme() string {
@@ -112,6 +134,28 @@ func (p Pod) Labels() map[string]string {
 	return newMap
 }
 
+func (p Pod) FlowFilters() []*flow.FlowFilter {
+	// When pod is a host netns pod running on a node w/o Cilium, we need to use
+	// that pod IP addrs (=host IP) for flow filtering, as Hubble is not aware
+	// of that pod name because it doesn't belong to a Cilium cluster.
+	if p.Outside {
+		podIPs := make([]string, 0, len(p.Pod.Status.PodIPs))
+		for _, ip := range p.Pod.Status.PodIPs {
+			podIPs = append(podIPs, ip.IP)
+		}
+		return []*flow.FlowFilter{
+			{DestinationIp: podIPs},
+			{SourceIp: podIPs},
+		}
+	}
+
+	return []*flow.FlowFilter{
+		{SourcePod: []string{p.Name()}},
+		{DestinationPod: []string{p.Name()}},
+	}
+
+}
+
 // Service is a service acting as a peer in a connectivity test.
 // It implements interface TestPeer.
 type Service struct {
@@ -137,8 +181,30 @@ func (s Service) Path() string {
 }
 
 // Address returns the network address of the Service.
-func (s Service) Address(IPFamily) string {
-	return s.Service.Name
+func (s Service) Address(family IPFamily) string {
+	// If the cluster IP is empty (headless service case) or the IP family is set to any, return the service name
+	if s.Service.Spec.ClusterIP == "" || family == IPFamilyAny {
+		return s.Service.Name
+	}
+
+	getClusterIPForIPFamily := func(family v1.IPFamily) string {
+		for i, f := range s.Service.Spec.IPFamilies {
+			if f == family {
+				return s.Service.Spec.ClusterIPs[i]
+			}
+		}
+
+		return ""
+	}
+
+	switch family {
+	case IPFamilyV4:
+		return getClusterIPForIPFamily(v1.IPv4Protocol)
+	case IPFamilyV6:
+		return getClusterIPForIPFamily(v1.IPv6Protocol)
+	}
+
+	return ""
 }
 
 // Port returns the first port of the Service.
@@ -159,6 +225,84 @@ func (s Service) Labels() map[string]string {
 		newMap[k] = v
 	}
 	return newMap
+}
+
+func (s Service) FlowFilters() []*flow.FlowFilter {
+	return nil
+}
+
+func (s Service) ToNodeportService(node *v1.Node) NodeportService {
+	return NodeportService{
+		Service: s,
+		Node:    node,
+	}
+}
+
+// NodeportService wraps a Service and exposes it through its nodeport, acting as a peer in a connectivity test.
+// It implements interface TestPeer.
+type NodeportService struct {
+	Service Service
+	Node    *v1.Node
+}
+
+// Name returns name of the wrapped service.
+func (s NodeportService) Name() string {
+	return s.Service.Name()
+}
+
+// Scheme returns the scheme of the wrapped service.
+func (s NodeportService) Scheme() string {
+	return s.Service.Scheme()
+}
+
+// Path returns the path of the wrapped service.
+func (s NodeportService) Path() string {
+	return s.Service.Path()
+}
+
+// Address returns the node IP of the wrapped Service.
+func (s NodeportService) Address(family IPFamily) string {
+	if family == IPFamilyAny {
+		return s.Node.Status.Addresses[0].Address
+	}
+
+	for _, address := range s.Node.Status.Addresses {
+		if address.Type == v1.NodeInternalIP {
+			parsedAddress := net.ParseIP(address.Address)
+
+			switch family {
+			case IPFamilyV4:
+				if parsedAddress.To4() != nil {
+					return address.Address
+				}
+			case IPFamilyV6:
+				if parsedAddress.To16() != nil {
+					return address.Address
+				}
+			}
+		}
+	}
+
+	return ""
+}
+
+// Port returns the first nodeport of the wrapped Service.
+func (s NodeportService) Port() uint32 {
+	return uint32(s.Service.Service.Spec.Ports[0].NodePort)
+}
+
+// HasLabel checks if given label exists and value matches.
+func (s NodeportService) HasLabel(name, value string) bool {
+	return s.Service.HasLabel(name, value)
+}
+
+// Labels returns the copy of service labels
+func (s NodeportService) Labels() map[string]string {
+	return s.Service.Labels()
+}
+
+func (s NodeportService) FlowFilters() []*flow.FlowFilter {
+	return s.Service.FlowFilters()
 }
 
 // ExternalWorkload is an external workload acting as a peer in a
@@ -208,6 +352,10 @@ func (e ExternalWorkload) Labels() map[string]string {
 	return newMap
 }
 
+func (e ExternalWorkload) FlowFilters() []*flow.FlowFilter {
+	return nil
+}
+
 // ICMPEndpoint returns a new ICMP endpoint.
 func ICMPEndpoint(name, host string) TestPeer {
 	return icmpEndpoint{
@@ -251,13 +399,17 @@ func (ie icmpEndpoint) Port() uint32 {
 }
 
 // HasLabel checks if given label exists and value matches.
-func (ie icmpEndpoint) HasLabel(name, value string) bool {
+func (ie icmpEndpoint) HasLabel(_, _ string) bool {
 	return false
 }
 
 // Labels returns the copy of labels
 func (ie icmpEndpoint) Labels() map[string]string {
 	return make(map[string]string)
+}
+
+func (ie icmpEndpoint) FlowFilters() []*flow.FlowFilter {
+	return nil
 }
 
 // HTTPEndpoint returns a new endpoint with the given name and raw URL.
@@ -343,4 +495,8 @@ func (he httpEndpoint) Labels() map[string]string {
 		newMap[k] = v
 	}
 	return newMap
+}
+
+func (he httpEndpoint) FlowFilters() []*flow.FlowFilter {
+	return nil
 }

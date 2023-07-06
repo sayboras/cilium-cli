@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/blang/semver/v4"
 	"github.com/cilium/workerpool"
 	"helm.sh/helm/v3/pkg/action"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/cilium/cilium-cli/clustermesh"
 	"github.com/cilium/cilium-cli/defaults"
+	"github.com/cilium/cilium-cli/internal/utils"
 	"github.com/cilium/cilium-cli/k8s"
 )
 
@@ -30,26 +32,45 @@ type UninstallParameters struct {
 	RedactHelmCertKeys   bool
 	HelmChartDirectory   string
 	WorkerCount          int
+	Timeout              time.Duration
 }
 
 type K8sUninstaller struct {
-	client k8sInstallerImplementation
-	params UninstallParameters
-	flavor k8s.Flavor
+	client  k8sInstallerImplementation
+	params  UninstallParameters
+	flavor  k8s.Flavor
+	version semver.Version
 }
 
 func NewK8sUninstaller(client k8sInstallerImplementation, p UninstallParameters) *K8sUninstaller {
-	return &K8sUninstaller{
+	uninstaller := &K8sUninstaller{
 		client: client,
 		params: p,
 	}
+
+	// Version detection / validation is unnecessary in Helm mode.
+	if utils.IsInHelmMode() {
+		return uninstaller
+	}
+
+	ciliumVersion, err := client.GetRunningCiliumVersion(context.Background(), p.Namespace)
+	if err != nil {
+		uninstaller.Log("Error getting Cilium Version: %s", err)
+	}
+	version, err := semver.ParseTolerant(ciliumVersion)
+	if err != nil {
+		uninstaller.Log("Error parsing Cilium Version: %s", err)
+	} else {
+		uninstaller.version = version
+	}
+	return uninstaller
 }
 
 func (k *K8sUninstaller) Log(format string, a ...interface{}) {
 	fmt.Fprintf(k.params.Writer, format+"\n", a...)
 }
 
-func (k *K8sUninstaller) UninstallWithHelm(k8sClient genericclioptions.RESTClientGetter) error {
+func (k *K8sUninstaller) UninstallWithHelm(ctx context.Context, k8sClient genericclioptions.RESTClientGetter) error {
 	actionConfig := action.Configuration{}
 	// Use the default Helm driver (Kubernetes secret).
 	helmDriver := ""
@@ -60,7 +81,24 @@ func (k *K8sUninstaller) UninstallWithHelm(k8sClient genericclioptions.RESTClien
 	}
 	helmClient := action.NewUninstall(&actionConfig)
 	helmClient.Wait = k.params.Wait
-	_, err := helmClient.Run(defaults.HelmReleaseName)
+	helmClient.Timeout = k.params.Timeout
+	if _, err := helmClient.Run(defaults.HelmReleaseName); err != nil {
+		return err
+	}
+	// If aws-node daemonset exists, remove io.cilium/aws-node-enabled node selector.
+	if _, err := k.client.GetDaemonSet(ctx, AwsNodeDaemonSetNamespace, AwsNodeDaemonSetName, metav1.GetOptions{}); err != nil {
+		return nil
+	}
+	return k.undoAwsNodeNodeSelector(ctx)
+}
+
+func (k *K8sUninstaller) undoAwsNodeNodeSelector(ctx context.Context) error {
+	bytes := []byte(fmt.Sprintf(`[{"op":"remove","path":"/spec/template/spec/nodeSelector/%s"}]`, strings.ReplaceAll(AwsNodeDaemonSetNodeSelectorKey, "/", "~1")))
+	k.Log("⏪ Undoing the changes to the %q DaemonSet...", AwsNodeDaemonSetName)
+	_, err := k.client.PatchDaemonSet(ctx, AwsNodeDaemonSetNamespace, AwsNodeDaemonSetName, types.JSONPatchType, bytes, metav1.PatchOptions{})
+	if err != nil {
+		k.Log("❌ Failed to patch the %q DaemonSet, please remove it's node selector manually", AwsNodeDaemonSetName)
+	}
 	return err
 }
 
@@ -120,18 +158,14 @@ func (k *K8sUninstaller) Uninstall(ctx context.Context) error {
 
 	switch k.flavor.Kind {
 	case k8s.KindEKS:
-		bytes := []byte(fmt.Sprintf(`[{"op":"remove","path":"/spec/template/spec/nodeSelector/%s"}]`, strings.ReplaceAll(AwsNodeDaemonSetNodeSelectorKey, "/", "~1")))
-		k.Log("⏪ Undoing the changes to the %q DaemonSet...", AwsNodeDaemonSetName)
-		if _, err := k.client.PatchDaemonSet(ctx, AwsNodeDaemonSetNamespace, AwsNodeDaemonSetName, types.JSONPatchType, bytes, metav1.PatchOptions{}); err != nil {
-			k.Log("❌ Failed to patch the %q DaemonSet, please remove it's node selector manually", AwsNodeDaemonSetName)
-		}
+		k.undoAwsNodeNodeSelector(ctx)
 	case k8s.KindGKE:
 		k.Log("🔥 Deleting resource quotas...")
 		k.client.DeleteResourceQuota(ctx, k.params.Namespace, defaults.AgentResourceQuota, metav1.DeleteOptions{})
 		k.client.DeleteResourceQuota(ctx, k.params.Namespace, defaults.OperatorResourceQuota, metav1.DeleteOptions{})
 	}
 
-	if needsNodeInit(k.flavor.Kind) {
+	if needsNodeInit(k.flavor.Kind, k.version) {
 		k.Log("🔥 Deleting node init daemonset...")
 		k.client.DeleteDaemonSet(ctx, k.params.Namespace, defaults.NodeInitDaemonSetName, metav1.DeleteOptions{})
 	}

@@ -5,10 +5,12 @@ package utils
 
 import (
 	"fmt"
+	"os"
 	"reflect"
 	"testing"
 
 	"github.com/blang/semver/v4"
+	"github.com/stretchr/testify/assert"
 )
 
 func TestCheckVersion(t *testing.T) {
@@ -75,6 +77,19 @@ func TestParseCiliumVersion(t *testing.T) {
 			name:    "valid-version",
 			version: "v1.9.99",
 			want:    semver.Version{Major: 1, Minor: 9, Patch: 99},
+		},
+		{
+			name:    "valid-pre-release-version",
+			version: "1.13.90-dev.1234-main-5678abcd",
+			want: semver.Version{
+				Major: 1,
+				Minor: 13,
+				Patch: 90,
+				Pre: []semver.PRVersion{
+					{VersionStr: "dev", IsNum: false},
+					{VersionStr: "1234-main-5678abcd", IsNum: false},
+				},
+			},
 		},
 	}
 
@@ -189,4 +204,17 @@ func TestBuildImagePath(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestIsInHelmMode(t *testing.T) {
+	orig := os.Getenv(CLIModeVariableName)
+	defer func() {
+		assert.NoError(t, os.Setenv(CLIModeVariableName, orig))
+	}()
+	assert.NoError(t, os.Setenv(CLIModeVariableName, "helm"))
+	assert.True(t, IsInHelmMode())
+	assert.NoError(t, os.Setenv(CLIModeVariableName, "classic"))
+	assert.False(t, IsInHelmMode())
+	assert.NoError(t, os.Setenv(CLIModeVariableName, "random"))
+	assert.True(t, IsInHelmMode())
 }

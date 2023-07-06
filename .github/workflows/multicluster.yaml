@@ -3,7 +3,7 @@ name: Multicluster
 # Any change in triggers needs to be reflected in the concurrency group.
 on:
   ### FOR TESTING PURPOSES
-  # This workflow runs in the context of `master`, and ignores changes to
+  # This workflow runs in the context of `main`, and ignores changes to
   # workflow files in PRs. For testing changes to this workflow from a PR:
   # - Make sure the PR uses a branch from the base repository (requires write
   #   privileges). It will not work with a branch from a fork (missing secrets).
@@ -13,7 +13,7 @@ on:
   # - Don't forget to remove the `DO NOT MERGE` commit once satisfied. The run
   #   will disappear from the PR checks: please provide a direct link to the
   #   successful workflow run (can be found from Actions tab) in a comment.
-  # 
+  #
   # pull_request: {}
   ###
   pull_request_target: {}
@@ -26,12 +26,9 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  clusterName1: ${{ github.repository_owner }}-${{ github.event.repository.name }}-${{ github.run_id }}-mesh-1
-  clusterName2: ${{ github.repository_owner }}-${{ github.event.repository.name }}-${{ github.run_id }}-mesh-2
-  clusterNameBase: ${{ github.repository_owner }}-${{ github.event.repository.name }}-${{ github.run_id }}-mesh
   zone: us-west2-a
-  firewallRuleName: ${{ github.repository_owner }}-${{ github.event.repository.name }}-${{ github.run_id }}-rule
-  cilium_version: v1.13.2
+  # renovate: datasource=github-releases depName=cilium/cilium
+  cilium_version: v1.13.4
   kubectl_version: v1.23.6
   USE_GKE_GCLOUD_AUTH_PLUGIN: True
 
@@ -40,9 +37,21 @@ jobs:
     if: ${{ github.repository == 'cilium/cilium-cli' }}
     runs-on: ubuntu-22.04
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: ["classic", "helm"]
     steps:
       - name: Checkout
-        uses: actions/checkout@8e5e7e5ab8b370d6c329ec480221332ada57f0ab
+        uses: actions/checkout@c85c95e3d7251135ab7dc9ce3241c5835cc595a9 # v3.5.3
+
+      # Note: These names currently approach the limit of 40 characters
+      - name: Set mode-specific names
+        run: |
+          echo "clusterNameBase=${{ github.repository_owner }}-${{ github.event.repository.name }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.mode }}" >> $GITHUB_ENV
+          echo "clusterName1=${{ github.repository_owner }}-${{ github.event.repository.name }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.mode }}-1" >> $GITHUB_ENV
+          echo "clusterName2=${{ github.repository_owner }}-${{ github.event.repository.name }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.mode }}-2" >> $GITHUB_ENV
+          echo "firewallRuleName=${{ github.repository_owner }}-${{ github.event.repository.name }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.mode}}" >> $GITHUB_ENV
 
       - name: Install kubectl
         run: |
@@ -54,12 +63,12 @@ jobs:
 
       - name: Set up gcloud credentials
         id: 'auth'
-        uses: 'google-github-actions/auth@e8df18b60c5dd38ba618c121b779307266153fbf'
+        uses: google-github-actions/auth@35b0e87d162680511bf346c299f71c9c5c379033 # v1.1.1
         with:
           credentials_json: '${{ secrets.GCP_PR_SA_KEY }}'
 
       - name: Set up gcloud CLI
-        uses: google-github-actions/setup-gcloud@62d4898025f6041e16b1068643bfc5a696863587
+        uses: google-github-actions/setup-gcloud@e30db14379863a8c79331b04a9969f4c1e225e0b # v1.1.1
         with:
           project_id: ${{ secrets.GCP_PR_PROJECT_ID }}
           version: "405.0.0"
@@ -73,9 +82,10 @@ jobs:
           gcloud info
 
       - name: Set up Go
-        uses: actions/setup-go@4d34df0c2316fe8122ab82dc22947d607c0c91f9
+        uses: actions/setup-go@fac708d6674e30b6ba41289acaab6d4b75aa0753 # v4.0.1
         with:
-          go-version: 1.20.2
+          # renovate: datasource=golang-version depName=go
+          go-version: 1.20.5
 
       - name: Set up job variables
         id: vars
@@ -101,14 +111,41 @@ jobs:
             --labels "usage=${{ github.repository_owner }}-${{ github.event.repository.name }},owner=${{ steps.vars.outputs.owner }}" \
             --zone ${{ env.zone }} \
             --enable-ip-alias \
-            --create-subnetwork="" \
+            --create-subnetwork="range=/26" \
+            --cluster-ipv4-cidr="/21" \
+            --services-ipv4-cidr="/24" \
             --image-type COS_CONTAINERD \
             --num-nodes 2 \
             --machine-type e2-custom-2-4096 \
             --disk-type pd-standard \
             --disk-size 10GB \
             --node-taints node.cilium.io/agent-not-ready=true:NoExecute \
-            --preemptible
+            --preemptible \
+            --async
+
+      - name: Create GKE cluster 1
+        run: |
+          gcloud container clusters create ${{ env.clusterName1 }} \
+            --labels "usage=${{ github.repository_owner }}-${{ github.event.repository.name }},owner=${{ steps.vars.outputs.owner }}" \
+            --zone ${{ env.zone }} \
+            --enable-ip-alias \
+            --create-subnetwork="range=/26" \
+            --cluster-ipv4-cidr="/21" \
+            --services-ipv4-cidr="/24" \
+            --image-type COS_CONTAINERD \
+            --num-nodes 2 \
+            --machine-type e2-custom-2-4096 \
+            --disk-type pd-standard \
+            --disk-size 10GB \
+            --node-taints node.cilium.io/agent-not-ready=true:NoExecute \
+            --preemptible \
+            --async
+
+      - name: Wait for clusters to be provisioned
+        run: |
+          while [ "$(gcloud container operations list --filter="status=RUNNING AND targetLink~${{ env.clusterNameBase }}" --format="value(name)")" ];do
+            echo "cluster has an ongoing operation, waiting for all operations to finish"; sleep 10
+          done
 
       - name: Get cluster 2 credentials
         run: |
@@ -118,21 +155,6 @@ jobs:
         run: |
           .github/get-kubeconfig.sh
           mv kubeconfig kubeconfig-cluster2
-
-      - name: Create GKE cluster 1
-        run: |
-          gcloud container clusters create ${{ env.clusterName1 }} \
-            --labels "usage=${{ github.repository_owner }}-${{ github.event.repository.name }},owner=${{ steps.vars.outputs.owner }}" \
-            --zone ${{ env.zone }} \
-            --enable-ip-alias \
-            --create-subnetwork="" \
-            --image-type COS_CONTAINERD \
-            --num-nodes 2 \
-            --machine-type e2-custom-2-4096 \
-            --disk-type pd-standard \
-            --disk-size 10GB \
-            --node-taints node.cilium.io/agent-not-ready=true:NoExecute \
-            --preemptible
 
       - name: Get cluster 1 credentials
         run: |
@@ -168,6 +190,7 @@ jobs:
             --set test_script_cm=cilium-cli-test-script \
             --set cluster_name_1=${{ env.clusterName1 }} \
             --set cluster_name_2=${{ env.clusterName2 }} \
+            --set cilium_cli_mode=${{ matrix.mode }}
 
       - name: Wait for test job
         env:
@@ -228,7 +251,7 @@ jobs:
 
       - name: Upload artifacts
         if: ${{ !success() }}
-        uses: actions/upload-artifact@0b7f8abb1508181956e8e162db84b466c27e18ce
+        uses: actions/upload-artifact@0b7f8abb1508181956e8e162db84b466c27e18ce # v3.1.2
         with:
           name: cilium-sysdump-out.zip
           path: |

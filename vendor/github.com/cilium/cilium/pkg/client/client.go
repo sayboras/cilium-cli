@@ -390,10 +390,26 @@ func FormatStatusResponse(w io.Writer, sr *models.StatusResponse, sd StatusDetai
 		}
 	}
 
+	if sr.IPV4BigTCP != nil {
+		status := "Disabled"
+		if sr.IPV4BigTCP.Enabled {
+			max := fmt.Sprintf("[%d]", sr.IPV4BigTCP.MaxGSO)
+			if sr.IPV4BigTCP.MaxGRO != sr.IPV4BigTCP.MaxGSO {
+				max = fmt.Sprintf("[%d, %d]", sr.IPV4BigTCP.MaxGRO, sr.IPV4BigTCP.MaxGSO)
+			}
+			status = fmt.Sprintf("Enabled\t%s", max)
+		}
+		fmt.Fprintf(w, "IPv4 BIG TCP:\t%s\n", status)
+	}
+
 	if sr.IPV6BigTCP != nil {
-		status := "Enabled"
-		if !sr.IPV6BigTCP.Enabled {
-			status = "Disabled"
+		status := "Disabled"
+		if sr.IPV6BigTCP.Enabled {
+			max := fmt.Sprintf("[%d]", sr.IPV6BigTCP.MaxGSO)
+			if sr.IPV6BigTCP.MaxGRO != sr.IPV6BigTCP.MaxGSO {
+				max = fmt.Sprintf("[%d, %d]", sr.IPV6BigTCP.MaxGRO, sr.IPV6BigTCP.MaxGSO)
+			}
+			status = fmt.Sprintf("Enabled\t%s", max)
 		}
 		fmt.Fprintf(w, "IPv6 BIG TCP:\t%s\n", status)
 	}
@@ -509,8 +525,8 @@ func FormatStatusResponse(w io.Writer, sr *models.StatusResponse, sd StatusDetai
 	}
 
 	if sr.Proxy != nil {
-		fmt.Fprintf(w, "Proxy Status:\tOK, ip %s, %d redirects active on ports %s\n",
-			sr.Proxy.IP, sr.Proxy.TotalRedirects, sr.Proxy.PortRange)
+		fmt.Fprintf(w, "Proxy Status:\tOK, ip %s, %d redirects active on ports %s, Envoy: %s\n",
+			sr.Proxy.IP, sr.Proxy.TotalRedirects, sr.Proxy.PortRange, sr.Proxy.EnvoyDeploymentMode)
 		if sd.AllRedirects && sr.Proxy.TotalRedirects > 0 {
 			out := make([]string, 0, len(sr.Proxy.Redirects)+1)
 			for _, r := range sr.Proxy.Redirects {
