@@ -168,6 +168,9 @@ var (
 	//go:embed manifests/echo-ingress-l7-http.yaml
 	echoIngressL7HTTPPolicyYAML string
 
+	//go:embed manifests/echo-ingress-l7-http-deathstar.yaml
+	echoIngressDeathstarL7HTTPPolicyYAML string
+
 	//go:embed manifests/echo-ingress-l7-http-from-anywhere.yaml
 	echoIngressL7HTTPFromAnywherePolicyYAML string
 
@@ -882,6 +885,24 @@ func Run(ctx context.Context, ct *check.ConnectivityTest, extra Hooks) error {
 				return egress, check.ResultNone
 			}
 			return check.ResultDrop, check.ResultDefaultDenyIngressDrop
+		})
+
+	ct.NewTest("echo-ingress-l7-deathstar").
+		WithFeatureRequirements(features.RequireEnabled(features.L7Proxy)).
+		WithCiliumPolicy(echoIngressDeathstarL7HTTPPolicyYAML). // L7 allow policy with HTTP introspection
+		WithScenarios(
+			tests.PodToPodWithEndpoints(),
+		).
+		WithExpectations(func(a *check.Action) (egress, ingress check.Result) {
+			if a.Destination().Path() != "/v1/request-landing" {
+				return check.ResultDropCurlHTTPError, check.ResultNone
+			}
+			egress = check.ResultOK
+			// Expect all curls from client2 to be proxied and to be GET calls.
+			egress.HTTP = check.HTTP{
+				Method: "GET",
+			}
+			return egress, check.ResultNone
 		})
 
 	// Test L7 HTTP introspection using an ingress policy on echo pods.

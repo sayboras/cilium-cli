@@ -47,6 +47,7 @@ const (
 	echoSameNodeDeploymentName     = "echo-same-node"
 	echoOtherNodeDeploymentName    = "echo-other-node"
 	echoExternalNodeDeploymentName = "echo-external-node"
+	deathstarDeploymentName        = "deathstar"
 	corednsConfigMapName           = "coredns-configmap"
 	corednsConfigVolumeName        = "coredns-config-volume"
 	kindEchoName                   = "echo"
@@ -519,6 +520,16 @@ func (ct *ConnectivityTest) deploy(ctx context.Context) error {
 		}
 	}
 
+	_, err = ct.clients.src.GetService(ctx, ct.params.TestNamespace, deathstarDeploymentName, metav1.GetOptions{})
+	if err != nil {
+		ct.Logf("✨ [%s] Deploying %s service...", ct.clients.src.ClusterName(), deathstarDeploymentName)
+		svc := newService(deathstarDeploymentName, map[string]string{"name": deathstarDeploymentName}, serviceLabels, "http", 80)
+		_, err = ct.clients.src.CreateService(ctx, ct.params.TestNamespace, svc, metav1.CreateOptions{})
+		if err != nil {
+			return err
+		}
+	}
+
 	if ct.params.MultiCluster != "" {
 		_, err = ct.clients.src.GetService(ctx, ct.params.TestNamespace, echoOtherNodeDeploymentName, metav1.GetOptions{})
 		if err != nil {
@@ -606,6 +617,26 @@ func (ct *ConnectivityTest) deploy(ctx context.Context) error {
 		_, err = ct.clients.src.CreateDeployment(ctx, ct.params.TestNamespace, echoDeployment, metav1.CreateOptions{})
 		if err != nil {
 			return fmt.Errorf("unable to create deployment %s: %s", echoSameNodeDeploymentName, err)
+		}
+	}
+
+	_, err = ct.clients.src.GetDeployment(ctx, ct.params.TestNamespace, deathstarDeploymentName, metav1.GetOptions{})
+	if err != nil {
+		ct.Logf("✨ [%s] Deploying %s deployment...", ct.clients.src.ClusterName(), deathstarDeploymentName)
+		deathstarDeployment := newDeployment(deploymentParameters{
+			Name:         deathstarDeploymentName,
+			Kind:         "deathstar",
+			Image:        "quay.io/cilium/starwars:latest",
+			Annotations:  ct.params.DeploymentAnnotations.Match(deathstarDeploymentName),
+			NodeSelector: ct.params.NodeSelector,
+		})
+		_, err = ct.clients.src.CreateServiceAccount(ctx, ct.params.TestNamespace, k8s.NewServiceAccount(deathstarDeploymentName), metav1.CreateOptions{})
+		if err != nil {
+			return fmt.Errorf("unable to create service account %s: %s", deathstarDeploymentName, err)
+		}
+		_, err = ct.clients.src.CreateDeployment(ctx, ct.params.TestNamespace, deathstarDeployment, metav1.CreateOptions{})
+		if err != nil {
+			return fmt.Errorf("unable to create deployment %s: %s", deathstarDeploymentName, err)
 		}
 	}
 
